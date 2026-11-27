@@ -2,8 +2,7 @@
 ================================================================================
 VISTA: Vision-based Inertial-free Spatial Tracking Architecture
 Module: server.py
-High-Fidelity Foxglove Studio / RVIZ Style 3D Telemetry Visualizer
-Includes: Live Camera, Video Upload, Tuning Settings, Snapshot, Export CSV
+Foxglove Studio / RVIZ Style 3D Telemetry Visualizer powered by Real Monocular VO
 ================================================================================
 """
 
@@ -20,6 +19,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 
+from visual_odometry import VisualOdometry, PinholeCamera
+
 app = FastAPI(title="VISTA Robotics Ground Station")
 
 class TuningConfig(BaseModel):
@@ -28,7 +29,7 @@ class TuningConfig(BaseModel):
     minDistance: int
     trailDecay: float
 
-# Global Tracking State
+# Global Tracking Engine using True Visual Odometry
 class VISTAEngine:
     def __init__(self):
         self.lock = threading.Lock()
@@ -37,38 +38,13 @@ class VISTAEngine:
         self.cap = None
         self.running = True
         self.reinit_requested = False
-        self.trail_decay = 0.92
         
-        # Feature detector & LK params
-        self.feature_params = {
-            "maxCorners": 160,
-            "qualityLevel": 0.012,
-            "minDistance": 10,
-            "blockSize": 7
-        }
-        self.lk_params = {
-            "winSize": (21, 21),
-            "maxLevel": 3,
-            "criteria": (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        }
+        # Instantiate true monocular visual odometry pipeline
+        self.camera_model = PinholeCamera(width=640, height=480, fx=525.0, fy=525.0, cx=320.0, cy=240.0)
+        self.vo = VisualOdometry(self.camera_model)
         
-        self.prev_gray = None
-        self.p0 = None
-        self.trail_mask = None
         self.last_composite = None
-        self.palette = np.random.randint(60, 255, (300, 3))
-        
-        # Current Telemetry state
-        self.t_start = time.time()
-        self.bax = 0.68
-        self.bay = 0.42
-        self.bgx = 0.82
-        self.bgy = 0.48
-        self.bgz = 0.19
-        
-        self.drone_pos = [0.0, 0.0, 2.45]
-        self.detected_count = 0
-        self.tracked_count = 0
+        self.current_metrics = {}
         
         self.init_camera()
 
@@ -91,9 +67,11 @@ class VISTAEngine:
                 else:
                     self.cap = cv2.VideoCapture(sample_path)
                     
-            self.prev_gray = None
-            self.p0 = None
-            self.trail_mask = None
+            if self.cap is not None and self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                
+            self.vo.reset()
 
     def get_processed_frame(self):
         if not self.running and self.last_composite is not None:
@@ -101,7 +79,10 @@ class VISTAEngine:
 
         with self.lock:
             if self.cap is None or not self.cap.isOpened():
-                return np.zeros((480, 640, 3), dtype=np.uint8)
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "INITIALIZING CAMERA...", (150, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
+                return frame
                 
             ret, frame = self.cap.read()
             if not ret or frame is None:
@@ -110,130 +91,22 @@ class VISTAEngine:
                     ret, frame = self.cap.read()
                 if not ret or frame is None:
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, "SEARCHING CAMERA FEED...", (140, 240),
+                    cv2.putText(frame, "NO SIGNAL / RECONNECTING...", (130, 240),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
                     return frame
 
-            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            if self.trail_mask is None or self.trail_mask.shape != frame.shape:
-                self.trail_mask = np.zeros_like(frame)
-                
-            self.trail_mask = (self.trail_mask * self.trail_decay).astype(np.uint8)
-            
-            # Check reinit
-            if self.reinit_requested or self.p0 is None or len(self.p0) < 30:
-                self.p0 = cv2.goodFeaturesToTrack(curr_gray, mask=None, **self.feature_params)
-                self.detected_count = len(self.p0) if self.p0 is not None else 0
-                self.trail_mask = np.zeros_like(frame)
+            if self.reinit_requested:
+                self.vo.reset()
                 self.reinit_requested = False
 
-            self.tracked_count = 0
-            dx, dy = 0.0, 0.0
+            # Run through real Visual Odometry pipeline
+            vis_frame, telemetry = self.vo.process_frame(frame)
+            telemetry["source"] = self.source_type
+            telemetry["running"] = self.running
+            self.current_metrics = telemetry
             
-            if self.p0 is not None and len(self.p0) > 0 and self.prev_gray is not None:
-                try:
-                    p1, status, err = cv2.calcOpticalFlowPyrLK(
-                        self.prev_gray, curr_gray, self.p0, None, **self.lk_params
-                    )
-                    if p1 is not None and status is not None and self.p0 is not None:
-                        valid = (status.ravel() == 1)
-                        if np.any(valid):
-                            good_curr = p1[valid]
-                            good_prev = self.p0[valid]
-                            self.tracked_count = len(good_curr)
-
-                            if len(good_curr) > 0:
-                                disp = good_curr - good_prev
-                                disp_arr = np.asarray(disp).reshape(-1, 2)
-                                dx = float(np.median(disp_arr[:, 0]))
-                                dy = float(np.median(disp_arr[:, 1]))
-
-                            for i, (cp, pp) in enumerate(zip(good_curr, good_prev)):
-                                cx, cy = cp.ravel()
-                                px, py = pp.ravel()
-                                col = self.palette[i % len(self.palette)].tolist()
-                                cv2.line(self.trail_mask, (int(px), int(py)), (int(cx), int(cy)), col, 2, cv2.LINE_AA)
-                                cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 128), -1)
-
-                            self.p0 = good_curr.reshape(-1, 1, 2)
-                        else:
-                            self.p0 = None
-                    else:
-                        self.p0 = None
-                except Exception:
-                    self.p0 = None
-            else:
-                self.p0 = cv2.goodFeaturesToTrack(curr_gray, mask=None, **self.feature_params)
-                self.detected_count = len(self.p0) if self.p0 is not None else 0
-
-            self.prev_gray = curr_gray.copy()
-            
-            # Update drone kinematics
-            t_now = time.time() - self.t_start
-            self.update_telemetry(t_now, dx, dy)
-            
-            # Composite frame
-            composite = cv2.add(frame, self.trail_mask)
-            
-            # Telemetry HUD on lower right (matching reference image)
-            cv2.putText(composite, f"Features: {self.detected_count}", (frame.shape[1] - 135, frame.shape[0] - 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
-            cv2.putText(composite, f"Tracked: {self.tracked_count}", (frame.shape[1] - 135, frame.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 128), 1, cv2.LINE_AA)
-                        
-            self.last_composite = composite.copy()
-            return composite
-
-    def update_telemetry(self, t_now, dx, dy):
-        sim_pitch = 0.75 + 0.55 * np.sin(t_now * 0.85) + 0.2 * np.cos(t_now * 2.1) + (-dy * 0.015) + np.random.normal(0, 0.04)
-        decay = max(-1.2, 2.3 - (t_now * 0.25 % 3.8))
-        sim_roll = decay + 0.35 * np.sin(t_now * 1.8) + (-dx * 0.02) + np.random.normal(0, 0.06)
-        sim_yaw = 0.25 + 0.12 * np.sin(t_now * 0.4) + np.random.normal(0, 0.02)
-        
-        self.bax = 0.68 + dx * 0.01 + np.random.normal(0, 0.002)
-        self.bay = 0.42 + dy * 0.01 + np.random.normal(0, 0.002)
-        self.bgx = 0.82 + np.random.normal(0, 0.003)
-        self.bgy = 0.48 + np.random.normal(0, 0.003)
-        self.bgz = 0.19 + np.random.normal(0, 0.003)
-        
-        phase = (t_now % 16.0)
-        if 4.0 <= phase <= 6.5:
-            base_disp = 2.05 + 0.1 * np.sin(phase * 4.0)
-        elif phase > 14.0:
-            base_disp = 2.0 + 0.1 * np.cos(phase)
-        else:
-            base_disp = 2.48 + 0.05 * np.sin(phase * 2.0)
-        sim_disp_z = base_disp + np.random.normal(0, 0.02)
-        
-        self.drone_pos[0] += -dx * 0.02
-        self.drone_pos[1] += 0.04
-        self.drone_pos[2] = sim_disp_z
-
-        self.current_metrics = {
-            "time": round(t_now, 2),
-            "pitch": round(float(sim_pitch), 3),
-            "roll": round(float(sim_roll), 3),
-            "yaw": round(float(sim_yaw), 3),
-            "disp_z": round(float(sim_disp_z), 3),
-            "ref_ground": round(float(np.random.normal(0.01, 0.008)), 3),
-            "bax": round(float(self.bax), 4),
-            "bay": round(float(self.bay), 4),
-            "bgx": round(float(self.bgx), 4),
-            "bgy": round(float(self.bgy), 4),
-            "bgz": round(float(self.bgz), 4),
-            "drone_x": round(float(self.drone_pos[0]), 3),
-            "drone_y": round(float(self.drone_pos[1]), 3),
-            "drone_z": round(float(self.drone_pos[2]), 3),
-            "features": self.detected_count,
-            "tracked": self.tracked_count,
-            "error_x": round(1.2752820642 + sim_pitch * 0.01, 8),
-            "error_y": round(0.9584482857 + sim_roll * 0.01, 8),
-            "error_z": round(1.6702948290 + sim_yaw * 0.01, 8),
-            "timestamp": f"{1770234668 + t_now:.9f}",
-            "source": self.source_type,
-            "running": self.running
-        }
+            self.last_composite = vis_frame.copy()
+            return vis_frame
 
 
 engine = VISTAEngine()
@@ -264,9 +137,9 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            if hasattr(engine, "current_metrics"):
+            if hasattr(engine, "current_metrics") and engine.current_metrics:
                 await websocket.send_text(json.dumps(engine.current_metrics))
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)  # 25 Hz telemetry stream
     except WebSocketDisconnect:
         pass
 
@@ -324,10 +197,9 @@ def export_csv():
 
 @app.post("/api/tuning")
 def update_tuning(cfg: TuningConfig):
-    engine.feature_params["maxCorners"] = cfg.maxCorners
-    engine.feature_params["qualityLevel"] = cfg.qualityLevel
-    engine.feature_params["minDistance"] = cfg.minDistance
-    engine.trail_decay = cfg.trailDecay
+    engine.vo.max_features = cfg.maxCorners
+    engine.vo.quality_level = cfg.qualityLevel
+    engine.vo.min_distance = cfg.minDistance
     engine.reinit_requested = True
     return {"status": "ok"}
 
@@ -415,14 +287,6 @@ HTML_CONTENT = """
             color: #3fb950;
             border-color: #238636;
         }
-        .nav-btn.primary {
-            background-color: #1f6feb;
-            color: #ffffff;
-            border-color: #388bfd;
-        }
-        .nav-btn.primary:hover {
-            background-color: #388bfd;
-        }
 
         /* Main Workspace Grid: 3 Columns matching Reference Image */
         .workspace-grid {
@@ -466,15 +330,18 @@ HTML_CONTENT = """
         .panel-header .tools {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
             color: #555c66;
-            font-size: 0.72rem;
+            font-size: 0.70rem;
         }
         .panel-header .tools span {
             cursor: pointer;
+            padding: 1px 4px;
+            border-radius: 2px;
         }
         .panel-header .tools span:hover {
-            color: #9ca3af;
+            color: #38bdf8;
+            background-color: #1a1e27;
         }
 
         /* ==================== LEFT COLUMN ==================== */
@@ -507,7 +374,7 @@ HTML_CONTENT = """
         }
 
         .mini-plot-panel {
-            height: 105px;
+            height: 100px;
             display: flex;
             flex-direction: column;
             background-color: #09090b;
@@ -544,33 +411,45 @@ HTML_CONTENT = """
             position: relative;
         }
 
+        /* Compact Navigation Telemetry Panel (Exact requirements) */
         .extrinsics-panel {
-            height: 85px;
+            height: 110px;
             background-color: #09090b;
             padding: 6px 10px;
             font-family: "Courier New", Courier, monospace;
-            font-size: 0.70rem;
-            color: #6b7280;
+            font-size: 0.68rem;
+            color: #8b949e;
             display: flex;
             flex-direction: column;
-            justify-content: center;
+            justify-content: space-between;
             line-height: 1.35;
         }
-        .extrinsics-panel .topic {
-            color: #4b5563;
-            font-size: 0.68rem;
-            margin-bottom: 2px;
+        .telemetry-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
-        .extrinsics-panel .sub {
+        .telemetry-label {
             color: #6b7280;
-            font-size: 0.65rem;
+            text-transform: uppercase;
+            font-size: 0.62rem;
+            letter-spacing: 0.05em;
         }
-        .extrinsics-panel .val {
-            color: #22c55e;
+        .telemetry-val {
+            color: #38bdf8;
             font-weight: 600;
-            font-size: 0.75rem;
-            letter-spacing: 0.02em;
         }
+        .status-badge {
+            padding: 1px 6px;
+            border-radius: 2px;
+            font-weight: 700;
+            font-size: 0.62rem;
+        }
+        .badge-green { background: rgba(34, 197, 94, 0.2); color: #22c55e; border: 1px solid #22c55e; }
+        .badge-yellow { background: rgba(234, 179, 8, 0.2); color: #eab308; border: 1px solid #eab308; }
+        .badge-orange { background: rgba(249, 115, 22, 0.2); color: #f97316; border: 1px solid #f97316; }
+        .badge-red { background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; }
+        .badge-blue { background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid #38bdf8; }
 
         /* ==================== CENTER COLUMN ==================== */
         .center-col {
@@ -619,6 +498,32 @@ HTML_CONTENT = """
             background-color: #000000;
             position: relative;
         }
+        .threed-controls-bar {
+            position: absolute;
+            top: 28px;
+            right: 8px;
+            display: flex;
+            gap: 4px;
+            z-index: 10;
+        }
+        .threed-btn {
+            background-color: rgba(22, 26, 34, 0.85);
+            color: #9ca3af;
+            border: 1px solid #2d333b;
+            border-radius: 3px;
+            padding: 2px 6px;
+            font-size: 0.65rem;
+            font-family: monospace;
+            cursor: pointer;
+        }
+        .threed-btn:hover {
+            color: #38bdf8;
+            border-color: #38bdf8;
+        }
+        .threed-btn.active {
+            color: #22c55e;
+            border-color: #22c55e;
+        }
 
         /* Toast notification */
         #toast {
@@ -638,7 +543,7 @@ HTML_CONTENT = """
             pointer-events: none;
         }
 
-        /* Tuning Modal Overlay */
+        /* Tuning Modal */
         #tuningModal {
             position: fixed;
             top: 42px;
@@ -689,55 +594,39 @@ HTML_CONTENT = """
         <div class="brand">
             <span>🛰️ VISTA</span>
             <span style="color:#4b5563;">|</span>
-            <span style="color:#8b949e; font-size:0.72rem;">Spatial Tracking Telemetry</span>
+            <span style="color:#8b949e; font-size:0.72rem;">Monocular Visual Odometry Ground Station</span>
         </div>
 
         <div class="action-group">
-            <!-- 1. Live Camera Button -->
             <button class="nav-btn" id="btnCamera" onclick="setSource('webcam')">
                 <span>📷</span> Live Camera
             </button>
-
-            <!-- 2. Upload Video Button -->
             <button class="nav-btn" id="btnUpload" onclick="document.getElementById('videoUploadInput').click()">
                 <span>📁</span> Upload Video
             </button>
-
-            <!-- 3. Sample Flight Button -->
             <button class="nav-btn active" id="btnSample" onclick="setSource('sample')">
                 <span>🎞️</span> Sample Flight
             </button>
-
             <span style="color:#21262d; margin:0 4px;">|</span>
-
-            <!-- 4. Play / Pause Button -->
             <button class="nav-btn" id="btnPlayPause" onclick="togglePause()">
                 <span>⏸</span> Pause
             </button>
-
-            <!-- 5. Reinitialize Button -->
             <button class="nav-btn" onclick="triggerReinit()">
-                <span>🔄</span> Reinit
+                <span>🔄</span> Reinit VO
             </button>
-
-            <!-- 6. Snapshot Button -->
             <button class="nav-btn" onclick="captureSnapshot()">
                 <span>📸</span> Snapshot
             </button>
-
-            <!-- 7. Export CSV Button -->
             <button class="nav-btn" onclick="exportCSV()">
                 <span>📥</span> Export CSV
             </button>
-
-            <!-- 8. Algorithm Tuning Modal Toggle -->
             <button class="nav-btn" onclick="toggleTuningModal()">
                 <span>⚙️</span> Tuning
             </button>
         </div>
 
         <div style="font-size:0.70rem; color:#10b981;">
-            <span id="connStatus">● CONNECTED (30 Hz)</span>
+            <span id="connStatus">● MONOCULAR VO ENGINE ACTIVE</span>
         </div>
     </div>
 
@@ -748,19 +637,19 @@ HTML_CONTENT = """
             <span style="cursor:pointer; color:#888;" onclick="toggleTuningModal()">✕</span>
         </h4>
         <div class="tuning-row">
-            <label><span>Max Corners (maxCorners)</span><span id="lblCorners">160</span></label>
-            <input type="range" id="slCorners" min="30" max="300" step="10" value="160" oninput="applyTuning()">
+            <label><span>Max Features (Shi-Tomasi)</span><span id="lblCorners">180</span></label>
+            <input type="range" id="slCorners" min="40" max="350" step="10" value="180" oninput="applyTuning()">
         </div>
         <div class="tuning-row">
-            <label><span>Quality Level</span><span id="lblQuality">0.012</span></label>
-            <input type="range" id="slQuality" min="0.002" max="0.08" step="0.002" value="0.012" oninput="applyTuning()">
+            <label><span>Corner Quality Level</span><span id="lblQuality">0.015</span></label>
+            <input type="range" id="slQuality" min="0.002" max="0.08" step="0.002" value="0.015" oninput="applyTuning()">
         </div>
         <div class="tuning-row">
-            <label><span>Min Distance (px)</span><span id="lblDistance">10</span></label>
-            <input type="range" id="slDistance" min="4" max="25" step="1" value="10" oninput="applyTuning()">
+            <label><span>Min Distance (px)</span><span id="lblDistance">12</span></label>
+            <input type="range" id="slDistance" min="4" max="25" step="1" value="12" oninput="applyTuning()">
         </div>
         <div class="tuning-row">
-            <label><span>Trail Decay Rate</span><span id="lblDecay">0.92</span></label>
+            <label><span>Decay Rate</span><span id="lblDecay">0.92</span></label>
             <input type="range" id="slDecay" min="0.80" max="0.98" step="0.01" value="0.92" oninput="applyTuning()">
         </div>
     </div>
@@ -771,7 +660,7 @@ HTML_CONTENT = """
     <!-- 3-Column Workspace Matching Reference Image -->
     <div class="workspace-grid">
         
-        <!-- LEFT COLUMN: Live Camera + ba/bg plots + extrinsics -->
+        <!-- LEFT COLUMN: Live Camera + ba/bg plots + True Extrinsics Telemetry -->
         <div class="left-col">
             <!-- 1. Live Camera View -->
             <div class="panel camera-panel">
@@ -784,10 +673,10 @@ HTML_CONTENT = """
                 </div>
             </div>
 
-            <!-- 2. /ba.x, /ba.y Mini-Plot -->
+            <!-- 2. /ba.x, /ba.y Mini-Plot (Linear Rates) -->
             <div class="panel mini-plot-panel">
                 <div class="panel-header">
-                    <span class="title">📈 /ba.x &nbsp; /ba.y</span>
+                    <span class="title">📈 /ba.x &nbsp; /ba.y &nbsp; (Linear Rate)</span>
                     <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span></span>
                 </div>
                 <div class="mini-plot-body">
@@ -801,10 +690,10 @@ HTML_CONTENT = """
                 </div>
             </div>
 
-            <!-- 3. /bg.x, /bg.y, /bg.z Mini-Plot -->
+            <!-- 3. /bg.x, /bg.y, /bg.z Mini-Plot (Angular Rates) -->
             <div class="panel mini-plot-panel">
                 <div class="panel-header">
-                    <span class="title">📈 /bg.x &nbsp; /bg.y &nbsp; /bg.z</span>
+                    <span class="title">📈 /bg.x &nbsp; /bg.y &nbsp; /bg.z &nbsp; (Angular Rates)</span>
                     <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span></span>
                 </div>
                 <div class="mini-plot-body">
@@ -819,40 +708,58 @@ HTML_CONTENT = """
                 </div>
             </div>
 
-            <!-- 4. Extrinsics Error Readout Block (Exact format from image) -->
+            <!-- 4. Real Navigation & Telemetry Readout (Mathematically Computed) -->
             <div class="panel extrinsics-panel">
-                <div class="topic">/extrinsics/error_rpy</div>
-                <div class="sub" id="vecTimestamp">Vector3 @ 1770234668.314835968 sec</div>
-                <div class="val" id="vecX">1.2752820642653337</div>
-                <div class="val" id="vecY">0.9584482857580034</div>
-                <div class="val" id="vecZ">1.6702948290145821</div>
+                <div class="telemetry-row">
+                    <span class="telemetry-label">Camera Pose [Rel Scale]</span>
+                    <span class="telemetry-val" id="dispPose">X: 0.000 | Y: 0.000 | Z: 0.000</span>
+                </div>
+                <div class="telemetry-row">
+                    <span class="telemetry-label">Orientation (deg)</span>
+                    <span style="color:#d1d5db;" id="dispAngles">R: 0.00° | P: 0.00° | Y: 0.00°</span>
+                </div>
+                <div class="telemetry-row">
+                    <span class="telemetry-label">Visual Landmarks</span>
+                    <span style="color:#2dd4bf;" id="dispFeatures">Det: 0 | Trk: 0 | Inliers: 0</span>
+                </div>
+                <div class="telemetry-row">
+                    <span class="telemetry-label">VO Health Status</span>
+                    <span id="dispStatus" class="status-badge badge-green">STABLE</span>
+                </div>
+                <div class="telemetry-row">
+                    <span class="telemetry-label">GPS Satellites</span>
+                    <span style="color:#ef4444; font-weight:700;">UNAVAILABLE (GPS-Denied)</span>
+                </div>
             </div>
         </div>
 
-        <!-- CENTER COLUMN: Orientation Dynamics (pitch, roll, yaw) & Displacement Plots -->
+        <!-- CENTER COLUMN: Real Orientation Dynamics & Real Trajectory Plots -->
         <div class="center-col">
-            <!-- Top Main Plot: pitch, roll, yaw -->
+            <!-- Top Main Plot: Roll, Pitch, Yaw from True Rotation Matrix -->
             <div class="panel main-plot-panel">
                 <div class="panel-header">
-                    <span class="title">Plot</span>
+                    <span class="title">Plot | Orientation Dynamics (Roll, Pitch, Yaw)</span>
                     <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span> <span style="color:#d1d5db;">30</span></span>
                 </div>
-                <!-- Translucent Legend Box in Top-Left -->
                 <div class="overlay-legend">
-                    <div class="legend-item"><span class="legend-dot" style="background:#2dd4bf;"></span>pitch</div>
-                    <div class="legend-item"><span class="legend-dot" style="background:#f97316;"></span>roll</div>
-                    <div class="legend-item"><span class="legend-dot" style="background:#a3e635;"></span>yaw</div>
+                    <div class="legend-item"><span class="legend-dot" style="background:#2dd4bf;"></span>pitch (deg)</div>
+                    <div class="legend-item"><span class="legend-dot" style="background:#f97316;"></span>roll (deg)</div>
+                    <div class="legend-item"><span class="legend-dot" style="background:#a3e635;"></span>yaw (deg)</div>
                 </div>
                 <div class="plot-canvas-wrapper">
                     <canvas id="attChart"></canvas>
                 </div>
             </div>
 
-            <!-- Bottom Main Plot: Trajectory Displacement & Baseline -->
+            <!-- Bottom Main Plot: Real Estimated Trajectory Coordinates -->
             <div class="panel main-plot-panel">
                 <div class="panel-header">
-                    <span class="title">Plot</span>
+                    <span class="title">Plot | Estimated Camera Trajectory Displacement</span>
                     <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span></span>
+                </div>
+                <div class="overlay-legend" style="top:25px;">
+                    <div class="legend-item"><span class="legend-dot" style="background:#38bdf8;"></span>Y (forward)</div>
+                    <div class="legend-item"><span class="legend-dot" style="background:#ea580c;"></span>Z (altitude)</div>
                 </div>
                 <div class="plot-canvas-wrapper">
                     <canvas id="dispChart"></canvas>
@@ -860,12 +767,25 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- RIGHT COLUMN: 3D Spatial Odometry & Feature Point Cloud -->
+        <!-- RIGHT COLUMN: Upgraded 3D Spatial Odometry & Reconstructed Point Cloud -->
         <div class="right-col panel">
             <div class="panel-header">
-                <span class="title">3D</span>
+                <span class="title">3D Spatial Odometry (SE3 Frame)</span>
                 <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span> <span style="color:#38bdf8; font-weight:700;">3D</span></span>
             </div>
+
+            <!-- Interactive 3D Viewport Toolbar -->
+            <div class="threed-controls-bar">
+                <button class="threed-btn" onclick="setCamView('reset')">Reset</button>
+                <button class="threed-btn" onclick="setCamView('top')">Top</button>
+                <button class="threed-btn" onclick="setCamView('side')">Side</button>
+                <button class="threed-btn" onclick="setCamView('front')">Front</button>
+                <button class="threed-btn active" id="btnFollow" onclick="toggleFollow()">Follow</button>
+                <button class="threed-btn active" id="btnGrid" onclick="toggleGrid()">Grid</button>
+                <button class="threed-btn active" id="btnPoints" onclick="togglePoints()">Landmarks</button>
+                <button class="threed-btn" onclick="triggerReinit()">Clear Traj</button>
+            </div>
+
             <div id="threed-canvas-container"></div>
         </div>
 
@@ -873,8 +793,8 @@ HTML_CONTENT = """
 
     <!-- Scripts: Real-Time Charts & Three.js 3D Engine -->
     <script>
-        const MAX_POINTS = 55;
-        const labels = Array.from({length: MAX_POINTS}, (_, i) => (i * 0.28).toFixed(1));
+        const MAX_POINTS = 60;
+        const labels = Array.from({length: MAX_POINTS}, (_, i) => i);
 
         Chart.defaults.color = "#6b7280";
         Chart.defaults.borderColor = "#181a20";
@@ -888,8 +808,8 @@ HTML_CONTENT = """
             data: {
                 labels: labels,
                 datasets: [
-                    { data: Array(MAX_POINTS).fill(0.68), borderColor: "#38bdf8", borderWidth: 1.5, pointRadius: 0 },
-                    { data: Array(MAX_POINTS).fill(0.42), borderColor: "#fb923c", borderWidth: 1.5, pointRadius: 0 }
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#38bdf8", borderWidth: 1.5, pointRadius: 0 },
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#fb923c", borderWidth: 1.5, pointRadius: 0 }
                 ]
             },
             options: {
@@ -898,8 +818,8 @@ HTML_CONTENT = """
                 animation: false,
                 plugins: { legend: { display: false } },
                 scales: {
-                    x: { grid: { color: "#14161d" }, ticks: { maxTicksLimit: 7 } },
-                    y: { min: 0.0, max: 1.0, grid: { color: "#14161d" } }
+                    x: { grid: { color: "#14161d" }, ticks: { display: false } },
+                    y: { min: -1.0, max: 1.0, grid: { color: "#14161d" } }
                 }
             }
         });
@@ -911,9 +831,9 @@ HTML_CONTENT = """
             data: {
                 labels: labels,
                 datasets: [
-                    { data: Array(MAX_POINTS).fill(0.82), borderColor: "#38bdf8", borderWidth: 1.5, pointRadius: 0 },
-                    { data: Array(MAX_POINTS).fill(0.48), borderColor: "#fb923c", borderWidth: 1.5, pointRadius: 0 },
-                    { data: Array(MAX_POINTS).fill(0.19), borderColor: "#facc15", borderWidth: 1.5, pointRadius: 0 }
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#38bdf8", borderWidth: 1.5, pointRadius: 0 },
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#fb923c", borderWidth: 1.5, pointRadius: 0 },
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#facc15", borderWidth: 1.5, pointRadius: 0 }
                 ]
             },
             options: {
@@ -922,22 +842,22 @@ HTML_CONTENT = """
                 animation: false,
                 plugins: { legend: { display: false } },
                 scales: {
-                    x: { grid: { color: "#14161d" }, ticks: { maxTicksLimit: 7 } },
-                    y: { min: 0.0, max: 1.0, grid: { color: "#14161d" } }
+                    x: { grid: { color: "#14161d" }, ticks: { display: false } },
+                    y: { min: -1.0, max: 1.0, grid: { color: "#14161d" } }
                 }
             }
         });
 
-        // 3. attChart (pitch, roll, yaw)
+        // 3. attChart (pitch, roll, yaw from true rotation matrix)
         const ctxAtt = document.getElementById("attChart").getContext("2d");
         const attChart = new Chart(ctxAtt, {
             type: "line",
             data: {
                 labels: labels,
                 datasets: [
-                    { data: Array(MAX_POINTS).fill(0.8), borderColor: "#2dd4bf", borderWidth: 1.8, pointRadius: 0 },
-                    { data: Array(MAX_POINTS).fill(1.5), borderColor: "#f97316", borderWidth: 1.8, pointRadius: 0 },
-                    { data: Array(MAX_POINTS).fill(0.2), borderColor: "#a3e635", borderWidth: 1.5, pointRadius: 0 }
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#2dd4bf", borderWidth: 1.8, pointRadius: 0 },
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#f97316", borderWidth: 1.8, pointRadius: 0 },
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#a3e635", borderWidth: 1.5, pointRadius: 0 }
                 ]
             },
             options: {
@@ -947,20 +867,20 @@ HTML_CONTENT = """
                 plugins: { legend: { display: false } },
                 scales: {
                     x: { grid: { color: "#161820" }, ticks: { maxTicksLimit: 8 } },
-                    y: { min: -1.5, max: 3.0, grid: { color: "#161820" } }
+                    y: { min: -25.0, max: 25.0, grid: { color: "#161820" } }
                 }
             }
         });
 
-        // 4. dispChart (Z Trajectory & Baseline)
+        // 4. dispChart (Real Estimated Trajectory Components)
         const ctxDisp = document.getElementById("dispChart").getContext("2d");
         const dispChart = new Chart(ctxDisp, {
             type: "line",
             data: {
                 labels: labels,
                 datasets: [
-                    { data: Array(MAX_POINTS).fill(2.48), borderColor: "#38bdf8", borderWidth: 2.0, pointRadius: 0 },
-                    { data: Array(MAX_POINTS).fill(0.01), borderColor: "#ea580c", borderWidth: 1.4, pointRadius: 0 }
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#38bdf8", borderWidth: 2.0, pointRadius: 0 },
+                    { data: Array(MAX_POINTS).fill(0.0), borderColor: "#ea580c", borderWidth: 1.4, pointRadius: 0 }
                 ]
             },
             options: {
@@ -970,7 +890,7 @@ HTML_CONTENT = """
                 plugins: { legend: { display: false } },
                 scales: {
                     x: { grid: { color: "#161820" }, ticks: { maxTicksLimit: 8 } },
-                    y: { min: -0.5, max: 3.0, grid: { color: "#161820" } }
+                    y: { grid: { color: "#161820" } }
                 }
             }
         });
@@ -980,200 +900,110 @@ HTML_CONTENT = """
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x000000);
 
-        const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
-        camera.position.set(-7, -10, 8);
+        const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.05, 200);
+        camera.position.set(-5, -6, 4.5);
         camera.up.set(0, 0, 1);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
         renderer.setSize(container.clientWidth, container.clientHeight);
-        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         container.appendChild(renderer.domElement);
 
         const controls = new THREE.OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.08;
-        controls.target.set(0, 5, 2);
+        controls.target.set(0, 2, 0);
 
-        // 1. Sparse 3D Feature Point Cloud
-        const pointCount = 1400;
-        const geometry = new THREE.BufferGeometry();
-        const positions = new Float32Array(pointCount * 3);
-        const colors = new Float32Array(pointCount * 3);
+        // 1. Fixed Reference Coordinate Grid (Z = 0)
+        const gridHelper = new THREE.GridHelper(30, 30, 0x38bdf8, 0x171923);
+        gridHelper.rotation.x = Math.PI / 2;
+        scene.add(gridHelper);
 
-        const colorPalette = [
-            new THREE.Color(0x22c55e),
-            new THREE.Color(0x38bdf8),
-            new THREE.Color(0xa855f7),
-            new THREE.Color(0xec4899),
-            new THREE.Color(0xfacc15),
-            new THREE.Color(0xf97316)
-        ];
+        // 2. Fixed World Coordinate Axes at (0, 0, 0)
+        const axesHelper = new THREE.AxesHelper(1.5);
+        scene.add(axesHelper);
 
-        for (let i = 0; i < pointCount; i++) {
-            positions[i * 3 + 0] = (Math.random() - 0.5) * 12;
-            positions[i * 3 + 1] = Math.random() * 26 - 4;
-            positions[i * 3 + 2] = (Math.random() - 0.2) * 6;
+        // 3. Green Starting Origin Sphere
+        const originGeo = new THREE.SphereGeometry(0.12, 16, 16);
+        const originMat = new THREE.MeshBasicMaterial({ color: 0x22c55e });
+        const originMarker = new THREE.Mesh(originGeo, originMat);
+        originMarker.position.set(0, 0, 0);
+        scene.add(originMarker);
 
-            const c = colorPalette[Math.floor(Math.random() * colorPalette.length)];
-            colors[i * 3 + 0] = c.r;
-            colors[i * 3 + 1] = c.g;
-            colors[i * 3 + 2] = c.b;
-        }
+        // 4. Real Continuous Estimated Camera Trajectory Line (Cyan)
+        const MAX_TRAJ_PTS = 500;
+        const trajPositions = new Float32Array(MAX_TRAJ_PTS * 3);
+        const trajGeo = new THREE.BufferGeometry();
+        trajGeo.setAttribute("position", new THREE.BufferAttribute(trajPositions, 3));
+        trajGeo.setDrawRange(0, 1);
+        const trajMat = new THREE.LineBasicMaterial({ color: 0x2dd4bf, linewidth: 3 });
+        const trajectoryLine = new THREE.Line(trajGeo, trajMat);
+        scene.add(trajectoryLine);
 
-        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-        geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        // 5. True Reconstructed 3D Landmarks Point Cloud
+        const MAX_LANDMARKS = 1000;
+        const landmarkPositions = new Float32Array(MAX_LANDMARKS * 3);
+        const landmarkColors = new Float32Array(MAX_LANDMARKS * 3);
+        const landmarkGeo = new THREE.BufferGeometry();
+        landmarkGeo.setAttribute("position", new THREE.BufferAttribute(landmarkPositions, 3));
+        landmarkGeo.setAttribute("color", new THREE.BufferAttribute(landmarkColors, 3));
+        landmarkGeo.setDrawRange(0, 0);
 
-        const material = new THREE.PointsMaterial({
-            size: 0.12,
+        const landmarkMat = new THREE.PointsMaterial({
+            size: 0.10,
             vertexColors: true,
             transparent: true,
             opacity: 0.85
         });
-        const pointCloud = new THREE.Points(geometry, material);
-        scene.add(pointCloud);
+        const landmarkPoints = new THREE.Points(landmarkGeo, landmarkMat);
+        scene.add(landmarkPoints);
 
-        // ==================== 3D FLIGHT PATH & DRONE NAVIGATION ====================
-        // 1. Define the 3D Flight Corridor Path (matching the reference image diagonal trajectory)
-        const waypoints = [
-            new THREE.Vector3(6.2, -6.0, 0.6),
-            new THREE.Vector3(4.8, -1.5, 1.1),
-            new THREE.Vector3(3.2,  3.0, 1.7),
-            new THREE.Vector3(1.5,  7.5, 2.3),
-            new THREE.Vector3(-0.1, 12.0, 2.7),
-            new THREE.Vector3(-1.8, 16.5, 2.8),
-            new THREE.Vector3(-3.5, 21.0, 2.4),
-            new THREE.Vector3(-5.0, 25.5, 1.8),
-            new THREE.Vector3(-6.2, 30.0, 1.2)
-        ];
-        const flightCurve = new THREE.CatmullRomCurve3(waypoints, false, "catmullrom", 0.5);
-
-        // 2. Full Planned Path Track (Dual Rail Ribbon like Foxglove/RVIZ)
-        const fullPathPoints = flightCurve.getPoints(200);
-        const fullPathGeo = new THREE.BufferGeometry().setFromPoints(fullPathPoints);
-        const fullPathMat = new THREE.LineBasicMaterial({ color: 0x164e63, linewidth: 1 });
-        const fullTrackLine = new THREE.Line(fullPathGeo, fullPathMat);
-        scene.add(fullTrackLine);
-
-        // Parallel Lower Ground Shadow Rail
-        const groundPoints = fullPathPoints.map(p => new THREE.Vector3(p.x, p.y, 0.05));
-        const groundGeo = new THREE.BufferGeometry().setFromPoints(groundPoints);
-        const groundMat = new THREE.LineBasicMaterial({ color: 0x0f172a, linewidth: 1 });
-        scene.add(new THREE.Line(groundGeo, groundMat));
-
-        // 3. Dynamic Active Flown Trajectory Trail (Glowing Cyan Ribbon trailing behind drone)
-        const maxTraversedPts = 200;
-        const traversedGeo = new THREE.BufferGeometry();
-        const traversedPositions = new Float32Array(maxTraversedPts * 3);
-        traversedGeo.setAttribute("position", new THREE.BufferAttribute(traversedPositions, 3));
-        traversedGeo.setDrawRange(0, 2);
-        const traversedMat = new THREE.LineBasicMaterial({ color: 0x2dd4bf, linewidth: 3 });
-        const traversedLine = new THREE.Line(traversedGeo, traversedMat);
-        scene.add(traversedLine);
-
-        // 4. Detailed Red Quadcopter Drone Model (Matching reference image)
+        // 6. Camera / Drone Marker at Current Estimated Pose
         const droneGroup = new THREE.Group();
 
-        // Fuselage Main Ring (Bright Red Wireframe Ring)
-        const ringGeo = new THREE.TorusGeometry(0.55, 0.045, 12, 36);
+        // Red Center Fuselage Sphere
+        const redSphereGeo = new THREE.SphereGeometry(0.15, 16, 16);
+        const redSphereMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+        const centerSphere = new THREE.Mesh(redSphereGeo, redSphereMat);
+        droneGroup.add(centerSphere);
+
+        // Red Quadcopter Body Ring
+        const ringGeo = new THREE.TorusGeometry(0.40, 0.03, 8, 24);
         const ringMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
         const droneRing = new THREE.Mesh(ringGeo, ringMat);
         droneRing.rotation.x = Math.PI / 2;
         droneGroup.add(droneRing);
 
-        // Cross Arms (X-Frame)
-        const armGeo = new THREE.CylinderGeometry(0.025, 0.025, 1.4, 8);
-        const armMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
-        const arm1 = new THREE.Mesh(armGeo, armMat);
-        arm1.rotation.z = Math.PI / 4;
-        droneGroup.add(arm1);
-        const arm2 = new THREE.Mesh(armGeo, armMat);
-        arm2.rotation.z = -Math.PI / 4;
-        droneGroup.add(arm2);
+        // Heading Direction Arrow
+        const arrowGeo = new THREE.ConeGeometry(0.12, 0.35, 12);
+        const arrowMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
+        const headingArrow = new THREE.Mesh(arrowGeo, arrowMat);
+        headingArrow.rotation.x = -Math.PI / 2;
+        headingArrow.position.set(0, 0.45, 0);
+        droneGroup.add(headingArrow);
 
-        // 4 Rotor Disks & Spinning Blades
-        const rotorBlades = [];
-        const rotorOffset = 0.50;
-        const rotorPositions = [
-            [rotorOffset, rotorOffset],
-            [-rotorOffset, rotorOffset],
-            [rotorOffset, -rotorOffset],
-            [-rotorOffset, -rotorOffset]
-        ];
+        // Triad axes at drone body
+        const droneAxes = new THREE.AxesHelper(0.6);
+        droneGroup.add(droneAxes);
 
-        rotorPositions.forEach(([rx, ry]) => {
-            // Rotor Guard Ring
-            const rGuardGeo = new THREE.TorusGeometry(0.18, 0.018, 8, 24);
-            const rGuard = new THREE.Mesh(rGuardGeo, ringMat);
-            rGuard.rotation.x = Math.PI / 2;
-            rGuard.position.set(rx, ry, 0.05);
-            droneGroup.add(rGuard);
-
-            // Spinning Blade Line
-            const bladeGeo = new THREE.BufferGeometry().setFromPoints([
-                new THREE.Vector3(-0.16, 0, 0),
-                new THREE.Vector3(0.16, 0, 0)
-            ]);
-            const bladeMat = new THREE.LineBasicMaterial({ color: 0xff6b6b, linewidth: 2 });
-            const blade = new THREE.Line(bladeGeo, bladeMat);
-            blade.position.set(rx, ry, 0.05);
-            droneGroup.add(blade);
-            rotorBlades.push(blade);
-        });
-
-        // Forward Heading Indicator Cone
-        const arrowGeo = new THREE.ConeGeometry(0.16, 0.40, 12);
-        const arrowMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
-        const arrow = new THREE.Mesh(arrowGeo, arrowMat);
-        arrow.rotation.x = -Math.PI / 2;
-        arrow.position.set(0, 0.70, 0);
-        droneGroup.add(arrow);
-
+        droneGroup.position.set(0, 0, 0);
         scene.add(droneGroup);
 
-        // 5. Active Flight Along Trajectory Curve
-        let flightT = 0.0;
-        const flightSpeed = 0.0016; // Smooth realistic cruising velocity
-        let isFlightActive = true;
+        // Viewport flags
+        let followDrone = true;
+        let showGrid = true;
+        let showLandmarks = true;
+        let autoRotate = false;
 
         function animate() {
             requestAnimationFrame(animate);
 
-            if (isFlightActive) {
-                // Advance drone along flight curve
-                flightT += flightSpeed;
-                if (flightT >= 1.0) flightT = 0.0; // Continuous looping flight
+            if (autoRotate) {
+                scene.rotation.z += 0.003;
+            }
 
-                // Get current 3D position and forward tangent vector
-                const dronePos = flightCurve.getPointAt(flightT);
-                const tangent = flightCurve.getTangentAt(flightT);
-
-                // Update drone position
-                droneGroup.position.copy(dronePos);
-
-                // Align drone heading along trajectory tangent
-                const lookTarget = dronePos.clone().add(tangent);
-                droneGroup.lookAt(lookTarget);
-
-                // Natural banking on curved flight path
-                const bank = Math.sin(flightT * Math.PI * 4) * 0.20;
-                droneGroup.rotateZ(bank);
-                droneGroup.rotateX(0.08); // Slight forward pitch tilt
-
-                // Spin all 4 rotors
-                rotorBlades.forEach((b, idx) => {
-                    b.rotation.z += (idx % 2 === 0 ? 0.45 : -0.45);
-                });
-
-                // Update active trailing path behind drone
-                const sampleCount = Math.max(2, Math.floor(flightT * (maxTraversedPts - 1)));
-                const currentTraversed = flightCurve.getPoints(maxTraversedPts);
-                const posAttr = traversedGeo.attributes.position;
-                for (let i = 0; i < sampleCount; i++) {
-                    posAttr.setXYZ(i, currentTraversed[i].x, currentTraversed[i].y, currentTraversed[i].z);
-                }
-                posAttr.setXYZ(sampleCount, dronePos.x, dronePos.y, dronePos.z);
-                posAttr.needsUpdate = true;
-                traversedGeo.setDrawRange(0, sampleCount + 1);
+            if (followDrone) {
+                controls.target.lerp(droneGroup.position, 0.08);
             }
 
             controls.update();
@@ -1189,6 +1019,48 @@ HTML_CONTENT = """
             renderer.setSize(w, h);
         });
 
+        // 3D Controls
+        function setCamView(mode) {
+            followDrone = false;
+            document.getElementById("btnFollow").classList.remove("active");
+            const target = droneGroup.position;
+
+            if (mode === "top") {
+                camera.position.set(target.x, target.y, target.z + 12);
+                camera.up.set(0, 1, 0);
+                controls.target.copy(target);
+            } else if (mode === "side") {
+                camera.position.set(target.x + 10, target.y, target.z + 1.0);
+                camera.up.set(0, 0, 1);
+                controls.target.copy(target);
+            } else if (mode === "front") {
+                camera.position.set(target.x, target.y + 10, target.z + 1.0);
+                camera.up.set(0, 0, 1);
+                controls.target.copy(target);
+            } else {
+                camera.position.set(target.x - 5, target.y - 6, target.z + 4.5);
+                camera.up.set(0, 0, 1);
+                controls.target.copy(target);
+            }
+        }
+
+        function toggleFollow() {
+            followDrone = !followDrone;
+            document.getElementById("btnFollow").classList.toggle("active", followDrone);
+        }
+
+        function toggleGrid() {
+            showGrid = !showGrid;
+            gridHelper.visible = showGrid;
+            document.getElementById("btnGrid").classList.toggle("active", showGrid);
+        }
+
+        function togglePoints() {
+            showLandmarks = !showLandmarks;
+            landmarkPoints.visible = showLandmarks;
+            document.getElementById("btnPoints").classList.toggle("active", showLandmarks);
+        }
+
         // ==================== WEBSOCKET TELEMETRY STREAM ====================
         const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
@@ -1197,6 +1069,7 @@ HTML_CONTENT = """
         ws.onmessage = function(event) {
             const data = JSON.parse(event.data);
 
+            // 1. Update Charts
             baChart.data.datasets[0].data.shift();
             baChart.data.datasets[0].data.push(data.bax);
             baChart.data.datasets[1].data.shift();
@@ -1211,6 +1084,7 @@ HTML_CONTENT = """
             bgChart.data.datasets[2].data.push(data.bgz);
             bgChart.update();
 
+            // Att chart with real Euler angles
             attChart.data.datasets[0].data.shift();
             attChart.data.datasets[0].data.push(data.pitch);
             attChart.data.datasets[1].data.shift();
@@ -1219,18 +1093,73 @@ HTML_CONTENT = """
             attChart.data.datasets[2].data.push(data.yaw);
             attChart.update();
 
+            // Disp chart with real trajectory translation
             dispChart.data.datasets[0].data.shift();
-            dispChart.data.datasets[0].data.push(data.disp_z);
+            dispChart.data.datasets[0].data.push(data.pos_y);
             dispChart.data.datasets[1].data.shift();
-            dispChart.data.datasets[1].data.push(data.ref_ground);
+            dispChart.data.datasets[1].data.push(data.pos_z);
             dispChart.update();
 
-            document.getElementById("vecTimestamp").innerText = `Vector3 @ ${data.timestamp} sec`;
-            document.getElementById("vecX").innerText = data.error_x.toFixed(16);
-            document.getElementById("vecY").innerText = data.error_y.toFixed(16);
-            document.getElementById("vecZ").innerText = data.error_z.toFixed(16);
+            // 2. Update Compact Navigation Telemetry Display
+            document.getElementById("dispPose").innerText = 
+                `X: ${data.pos_x.toFixed(3)} | Y: ${data.pos_y.toFixed(3)} | Z: ${data.pos_z.toFixed(3)}`;
+            document.getElementById("dispAngles").innerText = 
+                `R: ${data.roll.toFixed(1)}° | P: ${data.pitch.toFixed(1)}° | Y: ${data.yaw.toFixed(1)}°`;
+            document.getElementById("dispFeatures").innerText = 
+                `Det: ${data.features} | Trk: ${data.tracked} | Inliers: ${data.inliers} (${data.inlier_ratio}%)`;
 
-            isFlightActive = data.running;
+            const statusEl = document.getElementById("dispStatus");
+            statusEl.innerText = data.status;
+            statusEl.className = "status-badge " + (
+                data.status === "STABLE" ? "badge-green" :
+                (data.status === "DEGRADED" ? "badge-yellow" :
+                (data.status === "UNSTABLE" ? "badge-orange" :
+                (data.status === "REINITIALIZING" ? "badge-blue" : "badge-red")))
+            );
+
+            // 3. Update 3D Drone Marker to Real Position & Real Attitude Orientation
+            droneGroup.position.set(data.pos_x, data.pos_y, data.pos_z);
+            // Apply Euler rotation (converted to radians)
+            const r_rad = THREE.MathUtils.degToRad(data.roll);
+            const p_rad = THREE.MathUtils.degToRad(data.pitch);
+            const y_rad = THREE.MathUtils.degToRad(data.yaw);
+            droneGroup.rotation.set(p_rad, y_rad, r_rad, 'ZYX');
+
+            // 4. Update Real Estimated Trajectory Ribbon
+            if (data.trajectory && data.trajectory.length > 1) {
+                const trajLen = data.trajectory.length;
+                const posArr = trajGeo.attributes.position;
+                for (let i = 0; i < trajLen && i < MAX_TRAJ_PTS; i++) {
+                    posArr.setXYZ(i, data.trajectory[i][0], data.trajectory[i][1], data.trajectory[i][2]);
+                }
+                posArr.needsUpdate = true;
+                trajGeo.setDrawRange(0, Math.min(trajLen, MAX_TRAJ_PTS));
+            }
+
+            // 5. Update Real Triangulated 3D Point Cloud Landmarks
+            if (data.landmarks_3d && data.landmarks_3d.length > 0) {
+                const count = data.landmarks_3d.length;
+                const ptsArr = landmarkGeo.attributes.position;
+                const colArr = landmarkGeo.attributes.color;
+
+                for (let i = 0; i < count && i < MAX_LANDMARKS; i++) {
+                    const lm = data.landmarks_3d[i];
+                    ptsArr.setXYZ(i, lm.x, lm.y, lm.z);
+
+                    // Color code landmarks: green for close depth, cyan for mid, purple for far
+                    const dist = Math.hypot(lm.x - data.pos_x, lm.y - data.pos_y);
+                    if (dist < 3.0) {
+                        colArr.setXYZ(i, 0.13, 0.77, 0.36); // green
+                    } else if (dist < 8.0) {
+                        colArr.setXYZ(i, 0.22, 0.74, 0.97); // cyan
+                    } else {
+                        colArr.setXYZ(i, 0.65, 0.33, 0.96); // purple
+                    }
+                }
+                ptsArr.needsUpdate = true;
+                colArr.needsUpdate = true;
+                landmarkGeo.setDrawRange(0, Math.min(count, MAX_LANDMARKS));
+            }
 
             // Update UI buttons based on active source
             if (data.source === "webcam") {
@@ -1249,11 +1178,7 @@ HTML_CONTENT = """
 
             // Update play/pause button text
             const btnPlay = document.getElementById("btnPlayPause");
-            if (data.running) {
-                btnPlay.innerHTML = "<span>⏸</span> Pause";
-            } else {
-                btnPlay.innerHTML = "<span>▶</span> Resume";
-            }
+            btnPlay.innerHTML = data.running ? "<span>⏸</span> Pause" : "<span>▶</span> Resume";
         };
 
         ws.onclose = function() {
@@ -1273,7 +1198,6 @@ HTML_CONTENT = """
                 .then(r => r.json())
                 .then(d => {
                     showToast(`Switched input to: ${src.toUpperCase()}`);
-                    // Refresh video img to force reconnect
                     document.getElementById("videoStreamImg").src = "/video_feed?t=" + new Date().getTime();
                 });
         }
@@ -1282,13 +1206,16 @@ HTML_CONTENT = """
             fetch("/api/toggle_pause", { method: "POST" })
                 .then(r => r.json())
                 .then(d => {
-                    showToast(d.running ? "Tracking Resumed" : "Tracking Paused");
+                    showToast(d.running ? "VO Tracking Resumed" : "VO Tracking Paused");
                 });
         }
 
         function triggerReinit() {
             fetch("/api/reinit", { method: "POST" })
-                .then(() => showToast("Features Re-initialized"));
+                .then(() => {
+                    trajGeo.setDrawRange(0, 1);
+                    showToast("VO Engine & Trajectory Re-initialized");
+                });
         }
 
         function handleFileUpload(input) {
