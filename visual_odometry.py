@@ -206,11 +206,14 @@ class VisualOdometry:
         P1 = self.cam.K @ np.hstack((R_rel, t_rel.reshape(3, 1)))
         
         # Triangulate points in homogeneous coordinates
-        pts_4d = cv2.triangulatePoints(
-            P0, P1,
-            p0_in.T.astype(np.float64),
-            p1_in.T.astype(np.float64)
-        )
+        try:
+            pts_4d = cv2.triangulatePoints(
+                P0, P1,
+                p0_in.T.astype(np.float64),
+                p1_in.T.astype(np.float64)
+            )
+        except Exception:
+            return []
         
         # Normalize by W to obtain Euclidean 3D coordinates in camera 0 frame
         w_coords = pts_4d[3, :]
@@ -295,27 +298,18 @@ class VisualOdometry:
             self.prev_gray, curr_gray, self.px_prev
         )
         self.tracked_features = len(p1_matched)
-        
-        # Feature Replenishment check: if tracked features drop, add new corners in unpopulated areas
-        if self.tracked_features < (self.max_features * 0.65):
-            new_corners = self.detect_features(curr_gray, existing_pts=p1_matched)
-            if len(new_corners) > 0:
-                p1_matched = np.vstack((p1_matched, new_corners))
-                # For newly detected points, set dummy p0 so they begin tracking next frame
-                p0_matched = np.vstack((p0_matched, new_corners))
-                self.detected_features = len(p1_matched)
-            self.tracking_status = "REINITIALIZING" if self.tracked_features < 30 else self.tracking_status
-        else:
-            self.detected_features = self.tracked_features
+        self.detected_features = self.tracked_features
 
         # ---------------------------------------------------------------------
-        # Step 3: Parallax & Degeneracy Check
+        # Step 3: Parallax & Tracking Loss Gate
         # ---------------------------------------------------------------------
-        if len(p0_matched) < 12:
+        if len(p0_matched) < 10:
             self.tracking_status = "LOST"
             self.confidence_score = 0.1
             self.px_prev = self.detect_features(curr_gray)
+            self.detected_features = len(self.px_prev)
             self.prev_gray = curr_gray.copy()
+            self.prev_frame = frame_bgr.copy()
             return frame_bgr, self.get_current_telemetry()
 
         displacements = p1_matched - p0_matched
@@ -326,9 +320,8 @@ class VisualOdometry:
         # ---------------------------------------------------------------------
         # Step 4: Essential Matrix & RANSAC Relative Pose Recovery
         # ---------------------------------------------------------------------
-        # If camera is stationary (flow < 0.6 px), suppress false translation drift
-        if median_flow < 0.6:
-            # Pure stationary hold
+        # If camera is stationary (median flow < 0.55 px), hold position to prevent drift
+        if median_flow < 0.55:
             self.tracking_status = "STABLE"
             self.ransac_inliers = len(p1_matched)
             self.inlier_ratio = 1.0
@@ -338,59 +331,99 @@ class VisualOdometry:
             self.rel_dy = 0.0
             self.rel_dz = 0.0
             self.motion_magnitude = 0.0
-            self.px_prev = p1_matched.copy()
+
+            # Feature Replenishment for NEXT frame (strictly after flow calculation)
+            pts_next = p1_matched.copy()
+            if len(pts_next) < int(self.max_features * 0.70):
+                new_corners = self.detect_features(curr_gray, existing_pts=pts_next)
+                if len(new_corners) > 0:
+                    pts_next = np.vstack((pts_next, new_corners))
+            self.px_prev = pts_next
+            self.detected_features = len(pts_next)
             self.prev_gray = curr_gray.copy()
-            vis_frame = self.draw_tracking_visualization(frame_bgr, p0_matched, p1_matched, np.ones(len(p0_matched), dtype=bool))
+            self.prev_frame = frame_bgr.copy()
+
+            vis_frame = self.draw_tracking_visualization(
+                frame_bgr, p0_matched, p1_matched, np.ones(len(p0_matched), dtype=bool)
+            )
             return vis_frame, self.get_current_telemetry()
 
-        # Compute Essential Matrix with 5-point RANSAC
-        E, inlier_mask = cv2.findEssentialMat(
-            p1_matched, p0_matched,
-            cameraMatrix=self.cam.K,
-            method=cv2.RANSAC,
-            prob=0.999,
-            threshold=1.2
-        )
-        
+        # Check feature point spatial dispersion to prevent degenerate collinearity in 5-point algorithm
+        p1_var = np.var(p1_matched, axis=0) if len(p1_matched) > 0 else np.array([0, 0])
+        p0_var = np.var(p0_matched, axis=0) if len(p0_matched) > 0 else np.array([0, 0])
+        min_dispersion = min(float(np.min(p1_var)), float(np.min(p0_var)))
+
+        E = None
+        inlier_mask = None
+        if min_dispersion >= 4.0 and len(p1_matched) >= 8:
+            try:
+                E, inlier_mask = cv2.findEssentialMat(
+                    p1_matched, p0_matched,
+                    cameraMatrix=self.cam.K,
+                    method=cv2.RANSAC,
+                    prob=0.999,
+                    threshold=1.2
+                )
+            except cv2.error:
+                E = None
+                inlier_mask = None
+            except Exception:
+                E = None
+                inlier_mask = None
+
         inliers_bool = (inlier_mask.ravel() == 1) if inlier_mask is not None else np.zeros(len(p1_matched), dtype=bool)
         self.ransac_inliers = int(np.sum(inliers_bool))
         self.inlier_ratio = self.ransac_inliers / max(1, len(p1_matched))
 
-        if E is None or self.ransac_inliers < 10 or self.inlier_ratio < 0.35:
-            # Geometric recovery failed or high outlier contamination
-            self.tracking_status = "UNSTABLE"
-            self.confidence_score = max(0.1, self.confidence_score * 0.8)
-            self.px_prev = p1_matched.copy()
+        if E is None or self.ransac_inliers < 8 or self.inlier_ratio < 0.25:
+            # Degraded estimation - maintain previous pose without crashing or jumping
+            self.tracking_status = "DEGRADED" if self.ransac_inliers >= 5 else "UNSTABLE"
+            self.confidence_score = max(0.1, self.confidence_score * 0.85)
+
+            # Replenish features for next frame
+            pts_next = p1_matched.copy()
+            if len(pts_next) < int(self.max_features * 0.70):
+                new_corners = self.detect_features(curr_gray, existing_pts=pts_next)
+                if len(new_corners) > 0:
+                    pts_next = np.vstack((pts_next, new_corners))
+            self.px_prev = pts_next
+            self.detected_features = len(pts_next)
             self.prev_gray = curr_gray.copy()
+            self.prev_frame = frame_bgr.copy()
+
             vis_frame = self.draw_tracking_visualization(frame_bgr, p0_matched, p1_matched, inliers_bool)
             return vis_frame, self.get_current_telemetry()
 
         # Recover relative rotation and translation direction
-        _, R_rel, t_rel, pose_mask = cv2.recoverPose(
-            E, p1_matched, p0_matched,
-            cameraMatrix=self.cam.K,
-            mask=inlier_mask
-        )
+        try:
+            _, R_rel, t_rel, pose_mask = cv2.recoverPose(
+                E, p1_matched, p0_matched,
+                cameraMatrix=self.cam.K,
+                mask=inlier_mask
+            )
+            # Verify R_rel validity (proper orthogonal matrix with det ~ +1)
+            if abs(float(np.linalg.det(R_rel)) - 1.0) > 0.08:
+                R_rel = np.eye(3, dtype=np.float64)
+                t_rel = np.zeros((3, 1), dtype=np.float64)
+        except Exception:
+            R_rel = np.eye(3, dtype=np.float64)
+            t_rel = np.zeros((3, 1), dtype=np.float64)
 
         # ---------------------------------------------------------------------
         # Step 5: Global Pose Accumulation & Coordinate Conversion
         # ---------------------------------------------------------------------
         # In recoverPose: p1 = R_rel * p0 + t_rel
-        # To update camera-to-world pose:
+        # Update camera-to-world pose:
         # R_world_new = R_world_prev * R_rel^T
-        # t_world_new = t_world_prev + R_world_prev * (scale * t_rel_cam0)
+        # t_world_new = t_world_prev + R_world_prev * (scale * t_rel)
         
         # Estimate relative scale factor based on median optical flow parallax:
-        # Scale is proportional to physical velocity over depth
         relative_scale = min(1.2, max(0.02, median_flow * 0.08))
-        
-        # Translation in camera frame
         step_t = relative_scale * t_rel.reshape(3, 1)
         
         # Sudden displacement anomaly check (reject unphysical teleportation)
         step_norm = float(np.linalg.norm(step_t))
         if step_norm > 2.5:
-            # Clamp anomalous jump
             step_t = (step_t / step_norm) * 2.5
 
         # EMA filter on translation delta to preserve true motion while removing jitter
@@ -422,12 +455,14 @@ class VisualOdometry:
         # ---------------------------------------------------------------------
         # Step 6: Sparse 3D Landmark Triangulation
         # ---------------------------------------------------------------------
-        new_landmarks = self.triangulate_landmarks(p0_matched, p1_matched, R_rel, t_rel, inliers_bool)
-        if len(new_landmarks) > 0:
-            self.landmarks_3d.extend(new_landmarks)
-            if len(self.landmarks_3d) > self.max_landmarks:
-                # Keep most recent landmarks
-                self.landmarks_3d = self.landmarks_3d[-self.max_landmarks:]
+        try:
+            new_landmarks = self.triangulate_landmarks(p0_matched, p1_matched, R_rel, t_rel, inliers_bool)
+            if len(new_landmarks) > 0:
+                self.landmarks_3d.extend(new_landmarks)
+                if len(self.landmarks_3d) > self.max_landmarks:
+                    self.landmarks_3d = self.landmarks_3d[-self.max_landmarks:]
+        except Exception:
+            pass
 
         # ---------------------------------------------------------------------
         # Step 7: Navigation Quality Assessment
@@ -438,7 +473,7 @@ class VisualOdometry:
         elif self.ransac_inliers >= 25 and self.inlier_ratio >= 0.45:
             self.tracking_status = "DEGRADED"
             self.confidence_score = 0.75
-        elif self.ransac_inliers >= 10:
+        elif self.ransac_inliers >= 8:
             self.tracking_status = "UNSTABLE"
             self.confidence_score = 0.45
         else:
@@ -446,13 +481,30 @@ class VisualOdometry:
             self.confidence_score = 0.10
 
         # Mean reprojection error approximation across inliers
-        self.reprojection_error = round(float(np.mean(disp_magnitudes[inliers_bool]) * 0.12), 3)
+        inlier_mags = disp_magnitudes[inliers_bool] if np.sum(inliers_bool) > 0 else np.array([0.0])
+        self.reprojection_error = round(float(np.mean(inlier_mags) * 0.12), 3)
 
-        # Prepare state for next iteration
-        # Only carry forward verified inlier feature points
-        self.px_prev = p1_matched[inliers_bool].copy()
+        # ---------------------------------------------------------------------
+        # Step 8: Prepare state for next iteration
+        # Carry forward verified inlier feature points and replenish if low
+        # ---------------------------------------------------------------------
+        inlier_pts = p1_matched[inliers_bool] if np.sum(inliers_bool) >= 8 else p1_matched
+        if len(inlier_pts) < int(self.max_features * 0.70):
+            new_corners = self.detect_features(curr_gray, existing_pts=inlier_pts)
+            if len(new_corners) > 0:
+                self.px_prev = np.vstack((inlier_pts, new_corners))
+            else:
+                self.px_prev = inlier_pts.copy()
+        else:
+            self.px_prev = inlier_pts.copy()
+
+        self.detected_features = len(self.px_prev)
         self.prev_gray = curr_gray.copy()
         self.prev_frame = frame_bgr.copy()
+
+        # Render visual feature tracking overlay
+        vis_frame = self.draw_tracking_visualization(frame_bgr, p0_matched, p1_matched, inliers_bool)
+        return vis_frame, self.get_current_telemetry()
 
         # Render visual feature tracking overlay
         vis_frame = self.draw_tracking_visualization(frame_bgr, p0_matched, p1_matched, inliers_bool)

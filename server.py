@@ -57,13 +57,18 @@ class VISTAEngine:
                     pass
                 
             if self.source_type == "webcam":
-                self.cap = cv2.VideoCapture(0)
+                # Use DirectShow on Windows for fast, non-blocking camera init
+                self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(0)
             elif self.source_type == "upload" and self.upload_path and os.path.exists(self.upload_path):
                 self.cap = cv2.VideoCapture(self.upload_path)
             else:
                 sample_path = "data/test_videos/sample_flight.mp4"
                 if not os.path.exists(sample_path):
-                    self.cap = cv2.VideoCapture(0)
+                    self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                    if not self.cap.isOpened():
+                        self.cap = cv2.VideoCapture(0)
                 else:
                     self.cap = cv2.VideoCapture(sample_path)
                     
@@ -84,11 +89,18 @@ class VISTAEngine:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
                 return frame
                 
-            ret, frame = self.cap.read()
+            try:
+                ret, frame = self.cap.read()
+            except Exception:
+                ret, frame = False, None
+
             if not ret or frame is None:
                 if self.source_type in ["sample", "upload"]:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = self.cap.read()
+                    try:
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = self.cap.read()
+                    except Exception:
+                        ret, frame = False, None
                 if not ret or frame is None:
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
                     cv2.putText(frame, "NO SIGNAL / RECONNECTING...", (130, 240),
@@ -99,8 +111,14 @@ class VISTAEngine:
                 self.vo.reset()
                 self.reinit_requested = False
 
-            # Run through real Visual Odometry pipeline
-            vis_frame, telemetry = self.vo.process_frame(frame)
+            # Run through real Visual Odometry pipeline with fallback protection
+            try:
+                vis_frame, telemetry = self.vo.process_frame(frame)
+            except Exception as ex:
+                vis_frame = frame.copy()
+                telemetry = self.vo.get_current_telemetry()
+                telemetry["status"] = "RECOVERING"
+
             telemetry["source"] = self.source_type
             telemetry["running"] = self.running
             self.current_metrics = telemetry
@@ -114,13 +132,21 @@ engine = VISTAEngine()
 
 def gen_video_frames():
     while True:
-        frame = engine.get_processed_frame()
-        ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if not ret:
-            continue
-        frame_bytes = buffer.tobytes()
-        yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+        try:
+            frame = engine.get_processed_frame()
+            if frame is None or frame.size == 0:
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "FRAME BUFFER EMPTY", (160, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ret:
+                time.sleep(0.033)
+                continue
+            frame_bytes = buffer.tobytes()
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+        except Exception:
+            time.sleep(0.05)
         time.sleep(0.033)
 
 
@@ -669,7 +695,7 @@ HTML_CONTENT = """
                     <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span></span>
                 </div>
                 <div class="camera-view">
-                    <img id="videoStreamImg" src="/video_feed" alt="VISTA Live Optical Flow Feed">
+                    <img id="videoStreamImg" src="/video_feed" alt="VISTA Live Optical Flow Feed" onerror="handleStreamError(this)">
                 </div>
             </div>
 
@@ -781,8 +807,10 @@ HTML_CONTENT = """
                 <button class="threed-btn" onclick="setCamView('side')">Side</button>
                 <button class="threed-btn" onclick="setCamView('front')">Front</button>
                 <button class="threed-btn active" id="btnFollow" onclick="toggleFollow()">Follow</button>
+                <button class="threed-btn active" id="btnTraj" onclick="toggleTraj()">Traj</button>
                 <button class="threed-btn active" id="btnGrid" onclick="toggleGrid()">Grid</button>
                 <button class="threed-btn active" id="btnPoints" onclick="togglePoints()">Landmarks</button>
+                <button class="threed-btn" id="btnAutoRot" onclick="toggleAutoRotate()">Auto Rot</button>
                 <button class="threed-btn" onclick="triggerReinit()">Clear Traj</button>
             </div>
 
@@ -974,11 +1002,11 @@ HTML_CONTENT = """
         droneRing.rotation.x = Math.PI / 2;
         droneGroup.add(droneRing);
 
-        // Heading Direction Arrow
+        // Heading Direction Arrow (pointing forward along +Y)
         const arrowGeo = new THREE.ConeGeometry(0.12, 0.35, 12);
         const arrowMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
         const headingArrow = new THREE.Mesh(arrowGeo, arrowMat);
-        headingArrow.rotation.x = -Math.PI / 2;
+        headingArrow.rotation.x = Math.PI / 2;
         headingArrow.position.set(0, 0.45, 0);
         droneGroup.add(headingArrow);
 
@@ -1061,6 +1089,18 @@ HTML_CONTENT = """
             document.getElementById("btnPoints").classList.toggle("active", showLandmarks);
         }
 
+        let showTraj = true;
+        function toggleTraj() {
+            showTraj = !showTraj;
+            trajectoryLine.visible = showTraj;
+            document.getElementById("btnTraj").classList.toggle("active", showTraj);
+        }
+
+        function toggleAutoRotate() {
+            autoRotate = !autoRotate;
+            document.getElementById("btnAutoRot").classList.toggle("active", autoRotate);
+        }
+
         // ==================== WEBSOCKET TELEMETRY STREAM ====================
         const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
@@ -1119,11 +1159,11 @@ HTML_CONTENT = """
 
             // 3. Update 3D Drone Marker to Real Position & Real Attitude Orientation
             droneGroup.position.set(data.pos_x, data.pos_y, data.pos_z);
-            // Apply Euler rotation (converted to radians)
+            // Apply Euler rotation: X=pitch, Y=roll, Z=yaw
             const r_rad = THREE.MathUtils.degToRad(data.roll);
             const p_rad = THREE.MathUtils.degToRad(data.pitch);
             const y_rad = THREE.MathUtils.degToRad(data.yaw);
-            droneGroup.rotation.set(p_rad, y_rad, r_rad, 'ZYX');
+            droneGroup.rotation.set(p_rad, r_rad, y_rad, 'ZYX');
 
             // 4. Update Real Estimated Trajectory Ribbon
             if (data.trajectory && data.trajectory.length > 1) {
@@ -1283,6 +1323,23 @@ HTML_CONTENT = """
                 })
             });
         }
+
+        // Auto stream reconnection and stall watchdog
+        let streamReconnectTimer = null;
+        function handleStreamError(img) {
+            clearTimeout(streamReconnectTimer);
+            streamReconnectTimer = setTimeout(() => {
+                img.src = "/video_feed?t=" + Date.now();
+            }, 600);
+        }
+
+        // Watchdog: If camera stream freezes or disconnects, auto-reconnect
+        setInterval(() => {
+            const img = document.getElementById("videoStreamImg");
+            if (img && (!img.complete || img.naturalWidth === 0)) {
+                img.src = "/video_feed?t=" + Date.now();
+            }
+        }, 3500);
     </script>
 </body>
 </html>
