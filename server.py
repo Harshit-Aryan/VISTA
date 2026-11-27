@@ -14,6 +14,7 @@ import json
 import asyncio
 import os
 import shutil
+import threading
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
@@ -30,6 +31,7 @@ class TuningConfig(BaseModel):
 # Global Tracking State
 class VISTAEngine:
     def __init__(self):
+        self.lock = threading.Lock()
         self.source_type = "sample"  # "sample", "webcam", "upload"
         self.upload_path = None
         self.cap = None
@@ -71,105 +73,117 @@ class VISTAEngine:
         self.init_camera()
 
     def init_camera(self):
-        if self.cap is not None:
-            self.cap.release()
-            
-        if self.source_type == "webcam":
-            self.cap = cv2.VideoCapture(0)
-        elif self.source_type == "upload" and self.upload_path and os.path.exists(self.upload_path):
-            self.cap = cv2.VideoCapture(self.upload_path)
-        else:
-            sample_path = "data/test_videos/sample_flight.mp4"
-            if not os.path.exists(sample_path):
-                self.cap = cv2.VideoCapture(0)
-            else:
-                self.cap = cv2.VideoCapture(sample_path)
+        with self.lock:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
                 
-        self.prev_gray = None
-        self.p0 = None
-        self.trail_mask = None
+            if self.source_type == "webcam":
+                self.cap = cv2.VideoCapture(0)
+            elif self.source_type == "upload" and self.upload_path and os.path.exists(self.upload_path):
+                self.cap = cv2.VideoCapture(self.upload_path)
+            else:
+                sample_path = "data/test_videos/sample_flight.mp4"
+                if not os.path.exists(sample_path):
+                    self.cap = cv2.VideoCapture(0)
+                else:
+                    self.cap = cv2.VideoCapture(sample_path)
+                    
+            self.prev_gray = None
+            self.p0 = None
+            self.trail_mask = None
 
     def get_processed_frame(self):
         if not self.running and self.last_composite is not None:
             return self.last_composite
 
-        if self.cap is None or not self.cap.isOpened():
-            self.init_camera()
-            
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            if self.source_type in ["sample", "upload"]:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = self.cap.read()
+        with self.lock:
+            if self.cap is None or not self.cap.isOpened():
+                return np.zeros((480, 640, 3), dtype=np.uint8)
+                
+            ret, frame = self.cap.read()
             if not ret or frame is None:
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "SEARCHING CAMERA FEED...", (140, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
-                return frame
+                if self.source_type in ["sample", "upload"]:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
+                if not ret or frame is None:
+                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(frame, "SEARCHING CAMERA FEED...", (140, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
+                    return frame
 
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        if self.trail_mask is None or self.trail_mask.shape != frame.shape:
-            self.trail_mask = np.zeros_like(frame)
+            curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-        self.trail_mask = (self.trail_mask * self.trail_decay).astype(np.uint8)
-        
-        # Check reinit
-        if self.reinit_requested or self.p0 is None or len(self.p0) < 30:
-            self.p0 = cv2.goodFeaturesToTrack(curr_gray, mask=None, **self.feature_params)
-            self.detected_count = len(self.p0) if self.p0 is not None else 0
-            self.trail_mask = np.zeros_like(frame)
-            self.reinit_requested = False
+            if self.trail_mask is None or self.trail_mask.shape != frame.shape:
+                self.trail_mask = np.zeros_like(frame)
+                
+            self.trail_mask = (self.trail_mask * self.trail_decay).astype(np.uint8)
+            
+            # Check reinit
+            if self.reinit_requested or self.p0 is None or len(self.p0) < 30:
+                self.p0 = cv2.goodFeaturesToTrack(curr_gray, mask=None, **self.feature_params)
+                self.detected_count = len(self.p0) if self.p0 is not None else 0
+                self.trail_mask = np.zeros_like(frame)
+                self.reinit_requested = False
 
-        self.tracked_count = 0
-        dx, dy = 0.0, 0.0
-        
-        if self.p0 is not None and len(self.p0) > 0 and self.prev_gray is not None:
-            p1, status, err = cv2.calcOpticalFlowPyrLK(
-                self.prev_gray, curr_gray, self.p0, None, **self.lk_params
-            )
-            if p1 is not None and status is not None:
-                good_curr = p1[status.ravel() == 1]
-                good_prev = self.p0[status.ravel() == 1]
-                self.tracked_count = len(good_curr)
+            self.tracked_count = 0
+            dx, dy = 0.0, 0.0
+            
+            if self.p0 is not None and len(self.p0) > 0 and self.prev_gray is not None:
+                try:
+                    p1, status, err = cv2.calcOpticalFlowPyrLK(
+                        self.prev_gray, curr_gray, self.p0, None, **self.lk_params
+                    )
+                    if p1 is not None and status is not None and self.p0 is not None:
+                        valid = (status.ravel() == 1)
+                        if np.any(valid):
+                            good_curr = p1[valid]
+                            good_prev = self.p0[valid]
+                            self.tracked_count = len(good_curr)
 
-                if len(good_curr) > 0:
-                    disp = good_curr - good_prev
-                    disp_arr = np.asarray(disp).reshape(-1, 2)
-                    dx = float(np.median(disp_arr[:, 0]))
-                    dy = float(np.median(disp_arr[:, 1]))
+                            if len(good_curr) > 0:
+                                disp = good_curr - good_prev
+                                disp_arr = np.asarray(disp).reshape(-1, 2)
+                                dx = float(np.median(disp_arr[:, 0]))
+                                dy = float(np.median(disp_arr[:, 1]))
 
-                for i, (cp, pp) in enumerate(zip(good_curr, good_prev)):
-                    cx, cy = cp.ravel()
-                    px, py = pp.ravel()
-                    col = self.palette[i % len(self.palette)].tolist()
-                    cv2.line(self.trail_mask, (int(px), int(py)), (int(cx), int(cy)), col, 2, cv2.LINE_AA)
-                    cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 128), -1)
+                            for i, (cp, pp) in enumerate(zip(good_curr, good_prev)):
+                                cx, cy = cp.ravel()
+                                px, py = pp.ravel()
+                                col = self.palette[i % len(self.palette)].tolist()
+                                cv2.line(self.trail_mask, (int(px), int(py)), (int(cx), int(cy)), col, 2, cv2.LINE_AA)
+                                cv2.circle(frame, (int(cx), int(cy)), 3, (0, 255, 128), -1)
 
-                self.p0 = good_curr.reshape(-1, 1, 2)
+                            self.p0 = good_curr.reshape(-1, 1, 2)
+                        else:
+                            self.p0 = None
+                    else:
+                        self.p0 = None
+                except Exception:
+                    self.p0 = None
             else:
-                self.p0 = None
-        else:
-            self.p0 = cv2.goodFeaturesToTrack(curr_gray, mask=None, **self.feature_params)
-            self.detected_count = len(self.p0) if self.p0 is not None else 0
+                self.p0 = cv2.goodFeaturesToTrack(curr_gray, mask=None, **self.feature_params)
+                self.detected_count = len(self.p0) if self.p0 is not None else 0
 
-        self.prev_gray = curr_gray.copy()
-        
-        # Update drone kinematics
-        t_now = time.time() - self.t_start
-        self.update_telemetry(t_now, dx, dy)
-        
-        # Composite frame
-        composite = cv2.add(frame, self.trail_mask)
-        
-        # Telemetry HUD on lower right (matching reference image)
-        cv2.putText(composite, f"Features: {self.detected_count}", (frame.shape[1] - 135, frame.shape[0] - 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(composite, f"Tracked: {self.tracked_count}", (frame.shape[1] - 135, frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 128), 1, cv2.LINE_AA)
-                    
-        self.last_composite = composite.copy()
-        return composite
+            self.prev_gray = curr_gray.copy()
+            
+            # Update drone kinematics
+            t_now = time.time() - self.t_start
+            self.update_telemetry(t_now, dx, dy)
+            
+            # Composite frame
+            composite = cv2.add(frame, self.trail_mask)
+            
+            # Telemetry HUD on lower right (matching reference image)
+            cv2.putText(composite, f"Features: {self.detected_count}", (frame.shape[1] - 135, frame.shape[0] - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(composite, f"Tracked: {self.tracked_count}", (frame.shape[1] - 135, frame.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 128), 1, cv2.LINE_AA)
+                        
+            self.last_composite = composite.copy()
+            return composite
 
     def update_telemetry(self, t_now, dx, dy):
         sim_pitch = 0.75 + 0.55 * np.sin(t_now * 0.85) + 0.2 * np.cos(t_now * 2.1) + (-dy * 0.015) + np.random.normal(0, 0.04)
@@ -1018,40 +1032,150 @@ HTML_CONTENT = """
         const pointCloud = new THREE.Points(geometry, material);
         scene.add(pointCloud);
 
-        // 2. Continuous 3D Flight Trajectory Trail
-        const trajPoints = [];
-        for (let y = -2; y < 14; y += 0.25) {
-            trajPoints.push(new THREE.Vector3(
-                Math.sin(y * 0.4) * 1.5,
-                y,
-                2.4 + Math.cos(y * 0.5) * 0.3
-            ));
-        }
-        const trajGeo = new THREE.BufferGeometry().setFromPoints(trajPoints);
-        const trajMat = new THREE.LineBasicMaterial({ color: 0x2dd4bf, linewidth: 2 });
-        const trajLine = new THREE.Line(trajGeo, trajMat);
-        scene.add(trajLine);
+        // ==================== 3D FLIGHT PATH & DRONE NAVIGATION ====================
+        // 1. Define the 3D Flight Corridor Path (matching the reference image diagonal trajectory)
+        const waypoints = [
+            new THREE.Vector3(6.2, -6.0, 0.6),
+            new THREE.Vector3(4.8, -1.5, 1.1),
+            new THREE.Vector3(3.2,  3.0, 1.7),
+            new THREE.Vector3(1.5,  7.5, 2.3),
+            new THREE.Vector3(-0.1, 12.0, 2.7),
+            new THREE.Vector3(-1.8, 16.5, 2.8),
+            new THREE.Vector3(-3.5, 21.0, 2.4),
+            new THREE.Vector3(-5.0, 25.5, 1.8),
+            new THREE.Vector3(-6.2, 30.0, 1.2)
+        ];
+        const flightCurve = new THREE.CatmullRomCurve3(waypoints, false, "catmullrom", 0.5);
 
-        // 3. Red Quadcopter Body Pose Ring
+        // 2. Full Planned Path Track (Dual Rail Ribbon like Foxglove/RVIZ)
+        const fullPathPoints = flightCurve.getPoints(200);
+        const fullPathGeo = new THREE.BufferGeometry().setFromPoints(fullPathPoints);
+        const fullPathMat = new THREE.LineBasicMaterial({ color: 0x164e63, linewidth: 1 });
+        const fullTrackLine = new THREE.Line(fullPathGeo, fullPathMat);
+        scene.add(fullTrackLine);
+
+        // Parallel Lower Ground Shadow Rail
+        const groundPoints = fullPathPoints.map(p => new THREE.Vector3(p.x, p.y, 0.05));
+        const groundGeo = new THREE.BufferGeometry().setFromPoints(groundPoints);
+        const groundMat = new THREE.LineBasicMaterial({ color: 0x0f172a, linewidth: 1 });
+        scene.add(new THREE.Line(groundGeo, groundMat));
+
+        // 3. Dynamic Active Flown Trajectory Trail (Glowing Cyan Ribbon trailing behind drone)
+        const maxTraversedPts = 200;
+        const traversedGeo = new THREE.BufferGeometry();
+        const traversedPositions = new Float32Array(maxTraversedPts * 3);
+        traversedGeo.setAttribute("position", new THREE.BufferAttribute(traversedPositions, 3));
+        traversedGeo.setDrawRange(0, 2);
+        const traversedMat = new THREE.LineBasicMaterial({ color: 0x2dd4bf, linewidth: 3 });
+        const traversedLine = new THREE.Line(traversedGeo, traversedMat);
+        scene.add(traversedLine);
+
+        // 4. Detailed Red Quadcopter Drone Model (Matching reference image)
         const droneGroup = new THREE.Group();
-        const ringGeo = new THREE.TorusGeometry(0.55, 0.04, 8, 32);
+
+        // Fuselage Main Ring (Bright Red Wireframe Ring)
+        const ringGeo = new THREE.TorusGeometry(0.55, 0.045, 12, 36);
         const ringMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
         const droneRing = new THREE.Mesh(ringGeo, ringMat);
         droneRing.rotation.x = Math.PI / 2;
         droneGroup.add(droneRing);
 
-        const arrowGeo = new THREE.ConeGeometry(0.18, 0.45, 12);
+        // Cross Arms (X-Frame)
+        const armGeo = new THREE.CylinderGeometry(0.025, 0.025, 1.4, 8);
+        const armMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
+        const arm1 = new THREE.Mesh(armGeo, armMat);
+        arm1.rotation.z = Math.PI / 4;
+        droneGroup.add(arm1);
+        const arm2 = new THREE.Mesh(armGeo, armMat);
+        arm2.rotation.z = -Math.PI / 4;
+        droneGroup.add(arm2);
+
+        // 4 Rotor Disks & Spinning Blades
+        const rotorBlades = [];
+        const rotorOffset = 0.50;
+        const rotorPositions = [
+            [rotorOffset, rotorOffset],
+            [-rotorOffset, rotorOffset],
+            [rotorOffset, -rotorOffset],
+            [-rotorOffset, -rotorOffset]
+        ];
+
+        rotorPositions.forEach(([rx, ry]) => {
+            // Rotor Guard Ring
+            const rGuardGeo = new THREE.TorusGeometry(0.18, 0.018, 8, 24);
+            const rGuard = new THREE.Mesh(rGuardGeo, ringMat);
+            rGuard.rotation.x = Math.PI / 2;
+            rGuard.position.set(rx, ry, 0.05);
+            droneGroup.add(rGuard);
+
+            // Spinning Blade Line
+            const bladeGeo = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(-0.16, 0, 0),
+                new THREE.Vector3(0.16, 0, 0)
+            ]);
+            const bladeMat = new THREE.LineBasicMaterial({ color: 0xff6b6b, linewidth: 2 });
+            const blade = new THREE.Line(bladeGeo, bladeMat);
+            blade.position.set(rx, ry, 0.05);
+            droneGroup.add(blade);
+            rotorBlades.push(blade);
+        });
+
+        // Forward Heading Indicator Cone
+        const arrowGeo = new THREE.ConeGeometry(0.16, 0.40, 12);
         const arrowMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
         const arrow = new THREE.Mesh(arrowGeo, arrowMat);
-        arrow.rotation.x = Math.PI / 2;
-        arrow.position.set(0, 0.65, 0);
+        arrow.rotation.x = -Math.PI / 2;
+        arrow.position.set(0, 0.70, 0);
         droneGroup.add(arrow);
 
-        droneGroup.position.set(0, 10, 2.4);
         scene.add(droneGroup);
+
+        // 5. Active Flight Along Trajectory Curve
+        let flightT = 0.0;
+        const flightSpeed = 0.0016; // Smooth realistic cruising velocity
+        let isFlightActive = true;
 
         function animate() {
             requestAnimationFrame(animate);
+
+            if (isFlightActive) {
+                // Advance drone along flight curve
+                flightT += flightSpeed;
+                if (flightT >= 1.0) flightT = 0.0; // Continuous looping flight
+
+                // Get current 3D position and forward tangent vector
+                const dronePos = flightCurve.getPointAt(flightT);
+                const tangent = flightCurve.getTangentAt(flightT);
+
+                // Update drone position
+                droneGroup.position.copy(dronePos);
+
+                // Align drone heading along trajectory tangent
+                const lookTarget = dronePos.clone().add(tangent);
+                droneGroup.lookAt(lookTarget);
+
+                // Natural banking on curved flight path
+                const bank = Math.sin(flightT * Math.PI * 4) * 0.20;
+                droneGroup.rotateZ(bank);
+                droneGroup.rotateX(0.08); // Slight forward pitch tilt
+
+                // Spin all 4 rotors
+                rotorBlades.forEach((b, idx) => {
+                    b.rotation.z += (idx % 2 === 0 ? 0.45 : -0.45);
+                });
+
+                // Update active trailing path behind drone
+                const sampleCount = Math.max(2, Math.floor(flightT * (maxTraversedPts - 1)));
+                const currentTraversed = flightCurve.getPoints(maxTraversedPts);
+                const posAttr = traversedGeo.attributes.position;
+                for (let i = 0; i < sampleCount; i++) {
+                    posAttr.setXYZ(i, currentTraversed[i].x, currentTraversed[i].y, currentTraversed[i].z);
+                }
+                posAttr.setXYZ(sampleCount, dronePos.x, dronePos.y, dronePos.z);
+                posAttr.needsUpdate = true;
+                traversedGeo.setDrawRange(0, sampleCount + 1);
+            }
+
             controls.update();
             renderer.render(scene, camera);
         }
@@ -1106,7 +1230,7 @@ HTML_CONTENT = """
             document.getElementById("vecY").innerText = data.error_y.toFixed(16);
             document.getElementById("vecZ").innerText = data.error_z.toFixed(16);
 
-            droneGroup.position.set(data.drone_x, 10 + (data.time * 0.2 % 5), data.drone_z);
+            isFlightActive = data.running;
 
             // Update UI buttons based on active source
             if (data.source === "webcam") {
