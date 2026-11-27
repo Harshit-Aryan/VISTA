@@ -29,7 +29,7 @@ class TuningConfig(BaseModel):
     minDistance: int
     trailDecay: float
 
-# Global Tracking Engine using True Visual Odometry
+# Global Tracking Engine using True Visual Odometry & Decoupled Background Worker
 class VISTAEngine:
     def __init__(self):
         self.lock = threading.Lock()
@@ -45,8 +45,13 @@ class VISTAEngine:
         
         self.last_composite = None
         self.current_metrics = {}
+        self.latest_jpeg = None
         
         self.init_camera()
+        
+        # Dedicated capture and processing worker thread (30 FPS)
+        self.worker = threading.Thread(target=self._capture_worker, daemon=True)
+        self.worker.start()
 
     def init_camera(self):
         with self.lock:
@@ -55,22 +60,26 @@ class VISTAEngine:
                     self.cap.release()
                 except Exception:
                     pass
+                self.cap = None
                 
             if self.source_type == "webcam":
-                # Use DirectShow on Windows for fast, non-blocking camera init
-                self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-                if not self.cap.isOpened():
-                    self.cap = cv2.VideoCapture(0)
+                # Try DirectShow first on Windows, then default MSMF, then index 1
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(0)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(1)
+                self.cap = cap
             elif self.source_type == "upload" and self.upload_path and os.path.exists(self.upload_path):
                 self.cap = cv2.VideoCapture(self.upload_path)
             else:
+                # Default sample video flight
                 sample_path = "data/test_videos/sample_flight.mp4"
                 if not os.path.exists(sample_path):
-                    self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-                    if not self.cap.isOpened():
-                        self.cap = cv2.VideoCapture(0)
-                else:
-                    self.cap = cv2.VideoCapture(sample_path)
+                    sample_path = "Drone POV Test Video.mp4"
+                self.cap = cv2.VideoCapture(sample_path)
                     
             if self.cap is not None and self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -78,76 +87,93 @@ class VISTAEngine:
                 
             self.vo.reset()
 
-    def get_processed_frame(self):
-        if not self.running and self.last_composite is not None:
-            return self.last_composite
+    def _capture_worker(self):
+        """
+        Runs in a dedicated background thread at a steady 30 FPS.
+        Completely decouples frame acquisition & VO processing from client HTTP connections.
+        """
+        while True:
+            t0 = time.time()
+            if not self.running:
+                time.sleep(0.04)
+                continue
 
-        with self.lock:
-            if self.cap is None or not self.cap.isOpened():
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "INITIALIZING CAMERA...", (150, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
-                return frame
-                
-            try:
-                ret, frame = self.cap.read()
-            except Exception:
-                ret, frame = False, None
+            frame = None
+            with self.lock:
+                if self.reinit_requested:
+                    self.vo.reset()
+                    self.reinit_requested = False
 
-            if not ret or frame is None:
-                if self.source_type in ["sample", "upload"]:
+                if self.cap is not None and self.cap.isOpened():
                     try:
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = self.cap.read()
+                        ret, raw = self.cap.read()
+                        if not ret or raw is None:
+                            # Loop video if sample or uploaded video reaches EOF
+                            if self.source_type in ["sample", "upload"]:
+                                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                ret, raw = self.cap.read()
+                        if ret and raw is not None:
+                            frame = raw
                     except Exception:
-                        ret, frame = False, None
-                if not ret or frame is None:
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, "NO SIGNAL / RECONNECTING...", (130, 240),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
-                    return frame
+                        frame = None
 
-            if self.reinit_requested:
-                self.vo.reset()
-                self.reinit_requested = False
-
-            # Run through real Visual Odometry pipeline with fallback protection
-            try:
-                vis_frame, telemetry = self.vo.process_frame(frame)
-            except Exception as ex:
-                vis_frame = frame.copy()
+            if frame is None:
+                # Fallback standby frame
+                vis_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                status_msg = "CONNECTING WEBCAM..." if self.source_type == "webcam" else "LOADING VIDEO FEED..."
+                cv2.putText(vis_frame, status_msg, (150, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 200, 255), 2)
                 telemetry = self.vo.get_current_telemetry()
-                telemetry["status"] = "RECOVERING"
+                telemetry["status"] = "INITIALIZING"
+                telemetry["source"] = self.source_type
+                telemetry["running"] = self.running
+                self.current_metrics = telemetry
+            else:
+                # Process through True Visual Odometry Pipeline
+                try:
+                    vis_frame, telemetry = self.vo.process_frame(frame)
+                except Exception as ex:
+                    vis_frame = frame.copy()
+                    telemetry = self.vo.get_current_telemetry()
+                    telemetry["status"] = "RECOVERING"
 
-            telemetry["source"] = self.source_type
-            telemetry["running"] = self.running
-            self.current_metrics = telemetry
-            
-            self.last_composite = vis_frame.copy()
-            return vis_frame
+                telemetry["source"] = self.source_type
+                telemetry["running"] = self.running
+                self.current_metrics = telemetry
+                self.last_composite = vis_frame.copy()
+
+            # Encode JPEG once for all connected clients
+            ret, buffer = cv2.imencode(".jpg", vis_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ret:
+                self.latest_jpeg = buffer.tobytes()
+
+            # Maintain stable ~30 FPS loop
+            elapsed = time.time() - t0
+            sleep_time = max(0.005, 0.033 - elapsed)
+            time.sleep(sleep_time)
 
 
 engine = VISTAEngine()
 
 
 def gen_video_frames():
+    """
+    Streams the latest encoded JPEG frame from VISTAEngine.
+    Decoupled from camera capture so multiple clients or reconnects never crash the camera.
+    """
+    last_sent = None
     while True:
         try:
-            frame = engine.get_processed_frame()
-            if frame is None or frame.size == 0:
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "FRAME BUFFER EMPTY", (160, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if not ret:
-                time.sleep(0.033)
-                continue
-            frame_bytes = buffer.tobytes()
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+            jpeg = engine.latest_jpeg
+            if jpeg is not None and jpeg is not last_sent:
+                last_sent = jpeg
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
+            time.sleep(0.025)
+        except (GeneratorExit, asyncio.CancelledError):
+            break
         except Exception:
             time.sleep(0.05)
-        time.sleep(0.033)
 
 
 @app.get("/video_feed")
@@ -178,7 +204,7 @@ def reinit():
 
 @app.post("/api/source/{src}")
 def set_source(src: str):
-    if src in ["sample", "webcam"]:
+    if src in ["sample", "webcam", "upload"]:
         engine.source_type = src
         engine.init_camera()
     return {"source": engine.source_type}
@@ -193,7 +219,8 @@ def toggle_pause():
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
     os.makedirs("data/test_videos", exist_ok=True)
-    file_path = os.path.join("data/test_videos", f"upload_{int(time.time())}_{file.filename}")
+    clean_name = f"upload_{int(time.time())}_{os.path.basename(file.filename)}"
+    file_path = os.path.abspath(os.path.join("data/test_videos", clean_name))
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     engine.upload_path = file_path
@@ -1404,11 +1431,14 @@ HTML_CONTENT = """
         }
 
         function setSource(src) {
+            showToast(`Switching input to: ${src.toUpperCase()}...`);
             fetch(`/api/source/${src}`, { method: "POST" })
                 .then(r => r.json())
                 .then(d => {
-                    showToast(`Switched input to: ${src.toUpperCase()}`);
-                    document.getElementById("videoStreamImg").src = "/video_feed?t=" + new Date().getTime();
+                    showToast(`Active Source: ${src.toUpperCase()}`);
+                })
+                .catch(err => {
+                    showToast("Failed to switch source.");
                 });
         }
 
@@ -1444,7 +1474,6 @@ HTML_CONTENT = """
             .then(r => r.json())
             .then(d => {
                 showToast(`Loaded video: ${d.filename}`);
-                document.getElementById("videoStreamImg").src = "/video_feed?t=" + new Date().getTime();
             })
             .catch(err => {
                 showToast("Upload failed.");
@@ -1496,22 +1525,14 @@ HTML_CONTENT = """
             });
         }
 
-        // Auto stream reconnection and stall watchdog
+        // Auto stream reconnection on error
         let streamReconnectTimer = null;
         function handleStreamError(img) {
             clearTimeout(streamReconnectTimer);
             streamReconnectTimer = setTimeout(() => {
                 img.src = "/video_feed?t=" + Date.now();
-            }, 600);
+            }, 1000);
         }
-
-        // Watchdog: If camera stream freezes or disconnects, auto-reconnect
-        setInterval(() => {
-            const img = document.getElementById("videoStreamImg");
-            if (img && (!img.complete || img.naturalWidth === 0)) {
-                img.src = "/video_feed?t=" + Date.now();
-            }
-        }, 3500);
     </script>
 </body>
 </html>
