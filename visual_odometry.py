@@ -79,13 +79,14 @@ class VisualOdometry:
         self.t_world = np.zeros((3, 1), dtype=np.float64)
         
         # Trajectory history in world coordinates (list of [x, y, z])
+        # Retains entire flight path history throughout the session
         self.trajectory = [[0.0, 0.0, 0.0]]
-        self.max_trajectory_len = 400
+        self.max_trajectory_len = 10000
         
         # Map of persistent 3D environmental landmarks in world coordinates
         # List of dicts: {'x': float, 'y': float, 'z': float, 'age': int, 'inlier': bool}
         self.landmarks_3d = []
-        self.max_landmarks = 600
+        self.max_landmarks = 1500
         
         # Telemetry metrics
         self.detected_features = 0
@@ -108,8 +109,8 @@ class VisualOdometry:
         self.rel_dz = 0.0
         self.motion_magnitude = 0.0
         
-        # Outlier & EMA smoothing factor
-        self.ema_alpha = 0.85
+        # Outlier & EMA smoothing factor (calibrated for stable, non-drifting grid motion)
+        self.ema_alpha = 0.40
         self.last_step_t = np.zeros((3, 1), dtype=np.float64)
 
     def reset(self):
@@ -418,13 +419,14 @@ class VisualOdometry:
         # t_world_new = t_world_prev + R_world_prev * (scale * t_rel)
         
         # Estimate relative scale factor based on median optical flow parallax:
-        relative_scale = min(1.2, max(0.02, median_flow * 0.08))
+        # Calibrated so drone traverses the 3D grid smoothly without excessive jump or grid velocity
+        relative_scale = min(0.14, max(0.005, median_flow * 0.010))
         step_t = relative_scale * t_rel.reshape(3, 1)
         
-        # Sudden displacement anomaly check (reject unphysical teleportation)
+        # Displacement clamping: prevent unphysical teleportation across grid
         step_norm = float(np.linalg.norm(step_t))
-        if step_norm > 2.5:
-            step_t = (step_t / step_norm) * 2.5
+        if step_norm > 0.28:
+            step_t = (step_t / step_norm) * 0.28
 
         # EMA filter on translation delta to preserve true motion while removing jitter
         filtered_step = self.ema_alpha * step_t + (1.0 - self.ema_alpha) * self.last_step_t
@@ -506,10 +508,6 @@ class VisualOdometry:
         vis_frame = self.draw_tracking_visualization(frame_bgr, p0_matched, p1_matched, inliers_bool)
         return vis_frame, self.get_current_telemetry()
 
-        # Render visual feature tracking overlay
-        vis_frame = self.draw_tracking_visualization(frame_bgr, p0_matched, p1_matched, inliers_bool)
-        return vis_frame, self.get_current_telemetry()
-
     def extract_euler_angles(self):
         """
         Extracts Roll, Pitch, and Yaw in degrees from the global rotation matrix R_world.
@@ -535,6 +533,7 @@ class VisualOdometry:
     def draw_tracking_visualization(self, frame, p0, p1, inlier_mask):
         """
         Draws active tracking points and motion vectors.
+        Nearby points with higher parallax are highlighted in bright yellow/gold rings.
         Inliers are highlighted in bright green/cyan; outliers in muted amber/red.
         """
         vis = frame.copy()
@@ -544,9 +543,16 @@ class VisualOdometry:
             is_inlier = inlier_mask[i] if i < len(inlier_mask) else False
             
             if is_inlier:
-                # Green tracked point + vector line
-                cv2.line(vis, (x0, y0), (x1, y1), (0, 220, 255), 1, cv2.LINE_AA)
-                cv2.circle(vis, (x1, y1), 3, (0, 255, 120), -1, cv2.LINE_AA)
+                flow_mag = float(np.hypot(pt1[0] - pt0[0], pt1[1] - pt0[1]))
+                if flow_mag >= 2.5:
+                    # Nearby environmental feature (large parallax): bright gold/yellow double ring
+                    cv2.line(vis, (x0, y0), (x1, y1), (0, 230, 255), 1, cv2.LINE_AA)
+                    cv2.circle(vis, (x1, y1), 4, (0, 215, 255), 1, cv2.LINE_AA)
+                    cv2.circle(vis, (x1, y1), 2, (0, 255, 255), -1, cv2.LINE_AA)
+                else:
+                    # Normal tracked inlier: green point + vector
+                    cv2.line(vis, (x0, y0), (x1, y1), (0, 220, 255), 1, cv2.LINE_AA)
+                    cv2.circle(vis, (x1, y1), 3, (0, 255, 120), -1, cv2.LINE_AA)
             else:
                 # Amber outlier point
                 cv2.circle(vis, (x1, y1), 2, (0, 140, 255), -1, cv2.LINE_AA)

@@ -551,6 +551,50 @@ HTML_CONTENT = """
             border-color: #22c55e;
         }
 
+        /* Sleek Grid Coordinates HUD Bar at Bottom of 3D Viewport */
+        .grid-coords-hud {
+            position: absolute;
+            bottom: 6px;
+            left: 8px;
+            right: 8px;
+            background-color: rgba(9, 11, 15, 0.88);
+            border: 1px solid rgba(38, 46, 60, 0.75);
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-size: 0.65rem;
+            font-family: "Courier New", Courier, monospace;
+            color: #8b949e;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+            backdrop-filter: blur(4px);
+            pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+        .grid-coords-hud .hud-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .grid-coords-hud .hud-label {
+            color: #6b7280;
+            font-size: 0.60rem;
+            font-weight: 600;
+        }
+        .grid-coords-hud .hud-val {
+            color: #38bdf8;
+            font-weight: 600;
+        }
+        .grid-coords-hud .hud-val.highlight {
+            color: #22c55e;
+            font-weight: 700;
+        }
+        .grid-coords-hud .hud-val.nearby {
+            color: #facc15;
+            font-weight: 700;
+        }
+
         /* Toast notification */
         #toast {
             position: fixed;
@@ -814,7 +858,16 @@ HTML_CONTENT = """
                 <button class="threed-btn" onclick="triggerReinit()">Clear Traj</button>
             </div>
 
-            <div id="threed-canvas-container"></div>
+            <div id="threed-canvas-container">
+                <!-- Bottom Grid Coordinates HUD Bar -->
+                <div class="grid-coords-hud">
+                    <div class="hud-item"><span class="hud-label">GRID EXTENTS:</span> <span class="hud-val">X: [-15, +15]m &nbsp; Y: [-15, +15]m</span></div>
+                    <div class="hud-item"><span class="hud-label">ORIGIN:</span> <span class="hud-val">(0.00, 0.00, 0.00)</span></div>
+                    <div class="hud-item"><span class="hud-label">STEP:</span> <span class="hud-val">1.0m</span></div>
+                    <div class="hud-item"><span class="hud-label">NEARBY PTS (&le;2.5m):</span> <span class="hud-val nearby" id="hudNearbyCount">0 pts</span></div>
+                    <div class="hud-item"><span class="hud-label">DRONE COORD:</span> <span class="hud-val highlight" id="hudDronePos">X: 0.000 | Y: 0.000 | Z: 0.000</span></div>
+                </div>
+            </div>
         </div>
 
     </div>
@@ -958,18 +1011,65 @@ HTML_CONTENT = """
         originMarker.position.set(0, 0, 0);
         scene.add(originMarker);
 
-        // 4. Real Continuous Estimated Camera Trajectory Line (Cyan)
-        const MAX_TRAJ_PTS = 500;
+        // 3b. 3D Spatial Grid Coordinate Labels along ground plane (Z = 0)
+        function createGridLabelSprite(text, color = "#64748b", fontSize = 26) {
+            const canvas = document.createElement("canvas");
+            canvas.width = 128;
+            canvas.height = 64;
+            const ctx = canvas.getContext("2d");
+            ctx.fillStyle = color;
+            ctx.font = `bold ${fontSize}px monospace`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(text, 64, 32);
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+            const sprite = new THREE.Sprite(spriteMat);
+            sprite.scale.set(1.4, 0.7, 1.0);
+            return sprite;
+        }
+
+        const gridLabelsGroup = new THREE.Group();
+        [-10, -5, 5, 10].forEach(val => {
+            const lblX = createGridLabelSprite(`${val > 0 ? "+" : ""}${val}m`, "#475569", 22);
+            lblX.position.set(val, -0.4, 0.02);
+            gridLabelsGroup.add(lblX);
+
+            const lblY = createGridLabelSprite(`${val > 0 ? "+" : ""}${val}m`, "#475569", 22);
+            lblY.position.set(-0.6, val, 0.02);
+            gridLabelsGroup.add(lblY);
+        });
+
+        const originLabel = createGridLabelSprite("(0,0) ORIGIN", "#22c55e", 24);
+        originLabel.position.set(0, -0.7, 0.02);
+        gridLabelsGroup.add(originLabel);
+
+        const xEast = createGridLabelSprite("+X (East)", "#38bdf8", 24);
+        xEast.position.set(15.2, 0, 0.02);
+        gridLabelsGroup.add(xEast);
+
+        const yNorth = createGridLabelSprite("+Y (North)", "#22c55e", 24);
+        yNorth.position.set(0, 15.2, 0.02);
+        gridLabelsGroup.add(yNorth);
+        scene.add(gridLabelsGroup);
+
+        // 4. Complete Continuous Estimated Trajectory Path (Supports Full Flight History)
+        const MAX_TRAJ_PTS = 10000;
         const trajPositions = new Float32Array(MAX_TRAJ_PTS * 3);
+        const trajColors = new Float32Array(MAX_TRAJ_PTS * 3);
         const trajGeo = new THREE.BufferGeometry();
         trajGeo.setAttribute("position", new THREE.BufferAttribute(trajPositions, 3));
+        trajGeo.setAttribute("color", new THREE.BufferAttribute(trajColors, 3));
         trajGeo.setDrawRange(0, 1);
-        const trajMat = new THREE.LineBasicMaterial({ color: 0x2dd4bf, linewidth: 3 });
+        const trajMat = new THREE.LineBasicMaterial({
+            vertexColors: true,
+            linewidth: 3
+        });
         const trajectoryLine = new THREE.Line(trajGeo, trajMat);
         scene.add(trajectoryLine);
 
-        // 5. True Reconstructed 3D Landmarks Point Cloud
-        const MAX_LANDMARKS = 1000;
+        // 5. Environmental 3D Landmarks Point Cloud (Distant / Background)
+        const MAX_LANDMARKS = 2000;
         const landmarkPositions = new Float32Array(MAX_LANDMARKS * 3);
         const landmarkColors = new Float32Array(MAX_LANDMARKS * 3);
         const landmarkGeo = new THREE.BufferGeometry();
@@ -978,13 +1078,29 @@ HTML_CONTENT = """
         landmarkGeo.setDrawRange(0, 0);
 
         const landmarkMat = new THREE.PointsMaterial({
-            size: 0.10,
+            size: 0.08,
             vertexColors: true,
             transparent: true,
-            opacity: 0.85
+            opacity: 0.65
         });
         const landmarkPoints = new THREE.Points(landmarkGeo, landmarkMat);
         scene.add(landmarkPoints);
+
+        // 5b. High-Visibility Highlighted Nearby Points (< 2.5m from Drone)
+        const MAX_NEARBY = 600;
+        const nearbyPositions = new Float32Array(MAX_NEARBY * 3);
+        const nearbyGeo = new THREE.BufferGeometry();
+        nearbyGeo.setAttribute("position", new THREE.BufferAttribute(nearbyPositions, 3));
+        nearbyGeo.setDrawRange(0, 0);
+
+        const nearbyMat = new THREE.PointsMaterial({
+            size: 0.26,
+            color: 0xfacc15, // Bright Neon Gold / Yellow
+            transparent: true,
+            opacity: 0.95
+        });
+        const nearbyPoints = new THREE.Points(nearbyGeo, nearbyMat);
+        scene.add(nearbyPoints);
 
         // 6. Camera / Drone Marker at Current Estimated Pose
         const droneGroup = new THREE.Group();
@@ -1001,6 +1117,18 @@ HTML_CONTENT = """
         const droneRing = new THREE.Mesh(ringGeo, ringMat);
         droneRing.rotation.x = Math.PI / 2;
         droneGroup.add(droneRing);
+
+        // Active Proximity Perception Range Ring (2.5m radius highlighting nearby space)
+        const proxRingGeo = new THREE.RingGeometry(2.44, 2.52, 48);
+        const proxRingMat = new THREE.MeshBasicMaterial({
+            color: 0xfacc15,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.35
+        });
+        const proxRing = new THREE.Mesh(proxRingGeo, proxRingMat);
+        proxRing.rotation.x = Math.PI / 2;
+        droneGroup.add(proxRing);
 
         // Heading Direction Arrow (pointing forward along +Y)
         const arrowGeo = new THREE.ConeGeometry(0.12, 0.35, 12);
@@ -1027,11 +1155,15 @@ HTML_CONTENT = """
             requestAnimationFrame(animate);
 
             if (autoRotate) {
-                scene.rotation.z += 0.003;
+                scene.rotation.z += 0.002;
             }
 
             if (followDrone) {
-                controls.target.lerp(droneGroup.position, 0.08);
+                // Smoothly pan camera position together with target so view angle doesn't wildly tilt or swing the grid
+                const prevTarget = controls.target.clone();
+                controls.target.lerp(droneGroup.position, 0.05);
+                const panDelta = controls.target.clone().sub(prevTarget);
+                camera.position.add(panDelta);
             }
 
             controls.update();
@@ -1080,12 +1212,14 @@ HTML_CONTENT = """
         function toggleGrid() {
             showGrid = !showGrid;
             gridHelper.visible = showGrid;
+            if (typeof gridLabelsGroup !== "undefined") gridLabelsGroup.visible = showGrid;
             document.getElementById("btnGrid").classList.toggle("active", showGrid);
         }
 
         function togglePoints() {
             showLandmarks = !showLandmarks;
             landmarkPoints.visible = showLandmarks;
+            if (typeof nearbyPoints !== "undefined") nearbyPoints.visible = showLandmarks;
             document.getElementById("btnPoints").classList.toggle("active", showLandmarks);
         }
 
@@ -1165,40 +1299,76 @@ HTML_CONTENT = """
             const y_rad = THREE.MathUtils.degToRad(data.yaw);
             droneGroup.rotation.set(p_rad, r_rad, y_rad, 'ZYX');
 
-            // 4. Update Real Estimated Trajectory Ribbon
-            if (data.trajectory && data.trajectory.length > 1) {
+            // 4. Update Complete Continuous Flight Path Trajectory Ribbon
+            if (data.trajectory && data.trajectory.length > 0) {
                 const trajLen = data.trajectory.length;
                 const posArr = trajGeo.attributes.position;
+                const colArr = trajGeo.attributes.color;
+
                 for (let i = 0; i < trajLen && i < MAX_TRAJ_PTS; i++) {
                     posArr.setXYZ(i, data.trajectory[i][0], data.trajectory[i][1], data.trajectory[i][2]);
+                    
+                    // Trajectory color gradient: Green (Start) -> Cyan (Path) -> Bright Red (Current Head)
+                    const progress = i / Math.max(1, trajLen - 1);
+                    if (i === 0) {
+                        colArr.setXYZ(i, 0.13, 0.77, 0.36); // Emerald start
+                    } else if (progress > 0.96) {
+                        colArr.setXYZ(i, 0.95, 0.27, 0.27); // Vivid red tip
+                    } else {
+                        colArr.setXYZ(i, 0.18 + 0.12 * progress, 0.85, 0.75 - 0.2 * progress); // Cyan gradient
+                    }
                 }
                 posArr.needsUpdate = true;
+                colArr.needsUpdate = true;
                 trajGeo.setDrawRange(0, Math.min(trajLen, MAX_TRAJ_PTS));
             }
 
-            // 5. Update Real Triangulated 3D Point Cloud Landmarks
+            // 5. Update Real Triangulated 3D Landmarks & Highlight Nearby Points
+            let nearbyCount = 0;
             if (data.landmarks_3d && data.landmarks_3d.length > 0) {
                 const count = data.landmarks_3d.length;
                 const ptsArr = landmarkGeo.attributes.position;
                 const colArr = landmarkGeo.attributes.color;
+                const nearArr = nearbyGeo.attributes.position;
 
                 for (let i = 0; i < count && i < MAX_LANDMARKS; i++) {
                     const lm = data.landmarks_3d[i];
                     ptsArr.setXYZ(i, lm.x, lm.y, lm.z);
 
-                    // Color code landmarks: green for close depth, cyan for mid, purple for far
-                    const dist = Math.hypot(lm.x - data.pos_x, lm.y - data.pos_y);
-                    if (dist < 3.0) {
-                        colArr.setXYZ(i, 0.13, 0.77, 0.36); // green
-                    } else if (dist < 8.0) {
-                        colArr.setXYZ(i, 0.22, 0.74, 0.97); // cyan
+                    // 3D Euclidean distance to current drone position
+                    const dist3d = Math.hypot(lm.x - data.pos_x, lm.y - data.pos_y, lm.z - data.pos_z);
+                    
+                    if (dist3d <= 2.5 && nearbyCount < MAX_NEARBY) {
+                        // Nearby Point: Add to highlighted points buffer (rendered as large, glowing neon points)
+                        nearArr.setXYZ(nearbyCount, lm.x, lm.y, lm.z);
+                        nearbyCount++;
+                    }
+
+                    // Distant/Background landmarks color coded by depth
+                    if (dist3d < 4.0) {
+                        colArr.setXYZ(i, 0.22, 0.74, 0.97); // Cyan
+                    } else if (dist3d < 9.0) {
+                        colArr.setXYZ(i, 0.50, 0.45, 0.90); // Lavender
                     } else {
-                        colArr.setXYZ(i, 0.65, 0.33, 0.96); // purple
+                        colArr.setXYZ(i, 0.60, 0.25, 0.80); // Purple
                     }
                 }
                 ptsArr.needsUpdate = true;
                 colArr.needsUpdate = true;
                 landmarkGeo.setDrawRange(0, Math.min(count, MAX_LANDMARKS));
+
+                nearArr.needsUpdate = true;
+                nearbyGeo.setDrawRange(0, nearbyCount);
+            }
+
+            // Update HUD Coordinates Bar at the bottom of the 3D Grid
+            const hudNearby = document.getElementById("hudNearbyCount");
+            if (hudNearby) {
+                hudNearby.innerText = `${nearbyCount} pts (dist \u2264 2.5m)`;
+            }
+            const hudPos = document.getElementById("hudDronePos");
+            if (hudPos) {
+                hudPos.innerText = `X: ${data.pos_x.toFixed(3)} | Y: ${data.pos_y.toFixed(3)} | Z: ${data.pos_z.toFixed(3)}`;
             }
 
             // Update UI buttons based on active source
@@ -1254,6 +1424,8 @@ HTML_CONTENT = """
             fetch("/api/reinit", { method: "POST" })
                 .then(() => {
                     trajGeo.setDrawRange(0, 1);
+                    if (typeof landmarkGeo !== "undefined") landmarkGeo.setDrawRange(0, 0);
+                    if (typeof nearbyGeo !== "undefined") nearbyGeo.setDrawRange(0, 0);
                     showToast("VO Engine & Trajectory Re-initialized");
                 });
         }
