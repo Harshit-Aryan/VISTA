@@ -3,6 +3,7 @@
 VISTA: Vision-based Inertial-free Spatial Tracking Architecture
 Module: server.py
 High-Fidelity Foxglove Studio / RVIZ Style 3D Telemetry Visualizer
+Includes: Live Camera, Video Upload, Tuning Settings, Snapshot, Export CSV
 ================================================================================
 """
 
@@ -12,19 +13,29 @@ import time
 import json
 import asyncio
 import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse
+import shutil
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from pydantic import BaseModel
 import uvicorn
 
 app = FastAPI(title="VISTA Robotics Ground Station")
 
+class TuningConfig(BaseModel):
+    maxCorners: int
+    qualityLevel: float
+    minDistance: int
+    trailDecay: float
+
 # Global Tracking State
 class VISTAEngine:
     def __init__(self):
-        self.source_type = "sample"  # "sample" or "webcam"
+        self.source_type = "sample"  # "sample", "webcam", "upload"
+        self.upload_path = None
         self.cap = None
         self.running = True
         self.reinit_requested = False
+        self.trail_decay = 0.92
         
         # Feature detector & LK params
         self.feature_params = {
@@ -42,16 +53,11 @@ class VISTAEngine:
         self.prev_gray = None
         self.p0 = None
         self.trail_mask = None
-        self.palette = np.random.randint(60, 255, (200, 3))
+        self.last_composite = None
+        self.palette = np.random.randint(60, 255, (300, 3))
         
         # Current Telemetry state
         self.t_start = time.time()
-        self.time_history = []
-        self.pitch_history = []
-        self.roll_history = []
-        self.yaw_history = []
-        self.disp_z_history = []
-        
         self.bax = 0.68
         self.bay = 0.42
         self.bgx = 0.82
@@ -70,10 +76,11 @@ class VISTAEngine:
             
         if self.source_type == "webcam":
             self.cap = cv2.VideoCapture(0)
+        elif self.source_type == "upload" and self.upload_path and os.path.exists(self.upload_path):
+            self.cap = cv2.VideoCapture(self.upload_path)
         else:
             sample_path = "data/test_videos/sample_flight.mp4"
             if not os.path.exists(sample_path):
-                # Fallback to generating sample or webcam
                 self.cap = cv2.VideoCapture(0)
             else:
                 self.cap = cv2.VideoCapture(sample_path)
@@ -83,19 +90,21 @@ class VISTAEngine:
         self.trail_mask = None
 
     def get_processed_frame(self):
+        if not self.running and self.last_composite is not None:
+            return self.last_composite
+
         if self.cap is None or not self.cap.isOpened():
             self.init_camera()
             
         ret, frame = self.cap.read()
         if not ret or frame is None:
-            if self.source_type == "sample":
+            if self.source_type in ["sample", "upload"]:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self.cap.read()
             if not ret or frame is None:
-                # Synthetic fallback frame
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "WAITING FOR CAMERA...", (140, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+                cv2.putText(frame, "SEARCHING CAMERA FEED...", (140, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (120, 120, 120), 2)
                 return frame
 
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -103,7 +112,7 @@ class VISTAEngine:
         if self.trail_mask is None or self.trail_mask.shape != frame.shape:
             self.trail_mask = np.zeros_like(frame)
             
-        self.trail_mask = (self.trail_mask * 0.92).astype(np.uint8)
+        self.trail_mask = (self.trail_mask * self.trail_decay).astype(np.uint8)
         
         # Check reinit
         if self.reinit_requested or self.p0 is None or len(self.p0) < 30:
@@ -126,8 +135,9 @@ class VISTAEngine:
 
                 if len(good_curr) > 0:
                     disp = good_curr - good_prev
-                    dx = float(np.median(disp[:, 0]))
-                    dy = float(np.median(disp[:, 1]))
+                    disp_arr = np.asarray(disp).reshape(-1, 2)
+                    dx = float(np.median(disp_arr[:, 0]))
+                    dy = float(np.median(disp_arr[:, 1]))
 
                 for i, (cp, pp) in enumerate(zip(good_curr, good_prev)):
                     cx, cy = cp.ravel()
@@ -158,26 +168,21 @@ class VISTAEngine:
         cv2.putText(composite, f"Tracked: {self.tracked_count}", (frame.shape[1] - 135, frame.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 128), 1, cv2.LINE_AA)
                     
+        self.last_composite = composite.copy()
         return composite
 
     def update_telemetry(self, t_now, dx, dy):
-        # Realistic continuous attitudes matching reference curves
-        # Pitch: green curve osc ~ 0.2 to 1.5
         sim_pitch = 0.75 + 0.55 * np.sin(t_now * 0.85) + 0.2 * np.cos(t_now * 2.1) + (-dy * 0.015) + np.random.normal(0, 0.04)
-        # Roll: orange curve decaying with oscillations from 2.5 down to -1.0
         decay = max(-1.2, 2.3 - (t_now * 0.25 % 3.8))
         sim_roll = decay + 0.35 * np.sin(t_now * 1.8) + (-dx * 0.02) + np.random.normal(0, 0.06)
-        # Yaw: flat yellow/green near 0.2
         sim_yaw = 0.25 + 0.12 * np.sin(t_now * 0.4) + np.random.normal(0, 0.02)
         
-        # Biases
         self.bax = 0.68 + dx * 0.01 + np.random.normal(0, 0.002)
         self.bay = 0.42 + dy * 0.01 + np.random.normal(0, 0.002)
         self.bgx = 0.82 + np.random.normal(0, 0.003)
         self.bgy = 0.48 + np.random.normal(0, 0.003)
         self.bgz = 0.19 + np.random.normal(0, 0.003)
         
-        # Displacement curve: stays ~2.5, dips to ~2.0, rises to 2.5
         phase = (t_now % 16.0)
         if 4.0 <= phase <= 6.5:
             base_disp = 2.05 + 0.1 * np.sin(phase * 4.0)
@@ -187,7 +192,6 @@ class VISTAEngine:
             base_disp = 2.48 + 0.05 * np.sin(phase * 2.0)
         sim_disp_z = base_disp + np.random.normal(0, 0.02)
         
-        # Drone 3D position
         self.drone_pos[0] += -dx * 0.02
         self.drone_pos[1] += 0.04
         self.drone_pos[2] = sim_disp_z
@@ -212,7 +216,9 @@ class VISTAEngine:
             "error_x": round(1.2752820642 + sim_pitch * 0.01, 8),
             "error_y": round(0.9584482857 + sim_roll * 0.01, 8),
             "error_z": round(1.6702948290 + sim_yaw * 0.01, 8),
-            "timestamp": f"{1770234668 + t_now:.9f}"
+            "timestamp": f"{1770234668 + t_now:.9f}",
+            "source": self.source_type,
+            "running": self.running
         }
 
 
@@ -265,6 +271,53 @@ def set_source(src: str):
     return {"source": engine.source_type}
 
 
+@app.post("/api/toggle_pause")
+def toggle_pause():
+    engine.running = not engine.running
+    return {"running": engine.running}
+
+
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...)):
+    os.makedirs("data/test_videos", exist_ok=True)
+    file_path = os.path.join("data/test_videos", f"upload_{int(time.time())}_{file.filename}")
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    engine.upload_path = file_path
+    engine.source_type = "upload"
+    engine.init_camera()
+    return {"status": "ok", "filename": file.filename}
+
+
+@app.post("/api/screenshot")
+def capture_screenshot():
+    os.makedirs("results/screenshots", exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join("results/screenshots", f"vista_telemetry_{ts}.png")
+    if engine.last_composite is not None:
+        cv2.imwrite(path, engine.last_composite)
+        return {"status": "ok", "path": path, "filename": f"vista_telemetry_{ts}.png"}
+    return {"status": "error", "message": "No frame available"}
+
+
+@app.get("/api/export_csv")
+def export_csv():
+    csv_path = "results/test_results.csv"
+    if os.path.exists(csv_path):
+        return FileResponse(csv_path, filename="vista_telemetry_results.csv", media_type="text/csv")
+    return {"error": "CSV not found"}
+
+
+@app.post("/api/tuning")
+def update_tuning(cfg: TuningConfig):
+    engine.feature_params["maxCorners"] = cfg.maxCorners
+    engine.feature_params["qualityLevel"] = cfg.qualityLevel
+    engine.feature_params["minDistance"] = cfg.minDistance
+    engine.trail_decay = cfg.trailDecay
+    engine.reinit_requested = True
+    return {"status": "ok"}
+
+
 # -----------------------------------------------------------------------------
 # Pixel-Perfect Foxglove Studio / RVIZ HTML & WebGL Dashboard
 # -----------------------------------------------------------------------------
@@ -300,15 +353,16 @@ HTML_CONTENT = """
 
         /* Top Minimal Foxglove Header Bar */
         .top-navbar {
-            height: 32px;
+            height: 36px;
             background-color: #0e0e11;
             border-bottom: 1px solid #1c1c21;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 12px;
-            font-size: 0.75rem;
+            padding: 0 10px;
+            font-size: 0.74rem;
             color: #8b949e;
+            z-index: 20;
         }
         .top-navbar .brand {
             font-weight: 700;
@@ -318,23 +372,42 @@ HTML_CONTENT = """
             gap: 8px;
             letter-spacing: 0.05em;
         }
-        .top-navbar .controls {
+        .top-navbar .action-group {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 6px;
         }
-        .top-navbar select, .top-navbar button {
-            background-color: #181c24;
+        .nav-btn {
+            background-color: #161a22;
             color: #c9d1d9;
             border: 1px solid #2d333b;
-            border-radius: 3px;
-            padding: 2px 8px;
+            border-radius: 4px;
+            padding: 3px 9px;
             font-size: 0.72rem;
+            font-weight: 500;
             cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            transition: all 0.15s ease;
         }
-        .top-navbar button:hover {
+        .nav-btn:hover {
             background-color: #262c36;
             color: #58a6ff;
+            border-color: #58a6ff;
+        }
+        .nav-btn.active {
+            background-color: #1f3527;
+            color: #3fb950;
+            border-color: #238636;
+        }
+        .nav-btn.primary {
+            background-color: #1f6feb;
+            color: #ffffff;
+            border-color: #388bfd;
+        }
+        .nav-btn.primary:hover {
+            background-color: #388bfd;
         }
 
         /* Main Workspace Grid: 3 Columns matching Reference Image */
@@ -342,7 +415,7 @@ HTML_CONTENT = """
             flex: 1;
             display: grid;
             grid-template-columns: 28% 33% 39%;
-            height: calc(100vh - 32px);
+            height: calc(100vh - 36px);
             background-color: #000000;
             gap: 2px;
             padding: 2px;
@@ -398,7 +471,6 @@ HTML_CONTENT = """
             height: 100%;
         }
 
-        /* Camera Feed Viewport */
         .camera-panel {
             flex: 1.15;
             display: flex;
@@ -418,10 +490,8 @@ HTML_CONTENT = """
             width: 100%;
             height: 100%;
             object-fit: cover;
-            border-radius: 0;
         }
 
-        /* Mini Plots for ba and bg */
         .mini-plot-panel {
             height: 105px;
             display: flex;
@@ -460,7 +530,6 @@ HTML_CONTENT = """
             position: relative;
         }
 
-        /* Extrinsics Readout (Bottom-Left Card) */
         .extrinsics-panel {
             height: 85px;
             background-color: #09090b;
@@ -507,7 +576,6 @@ HTML_CONTENT = """
             position: relative;
             padding: 4px 6px;
         }
-        /* Translucent Plot Legend Box in top-left matching reference */
         .overlay-legend {
             position: absolute;
             top: 30px;
@@ -537,35 +605,154 @@ HTML_CONTENT = """
             background-color: #000000;
             position: relative;
         }
-        .threed-tag {
-            position: absolute;
-            top: 6px;
-            right: 12px;
-            color: #38bdf8;
-            font-weight: 700;
-            font-size: 0.72rem;
-            z-index: 5;
+
+        /* Toast notification */
+        #toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: #1f242d;
+            border: 1px solid #388bfd;
+            color: #58a6ff;
+            padding: 8px 14px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-family: monospace;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            z-index: 99;
+            pointer-events: none;
+        }
+
+        /* Tuning Modal Overlay */
+        #tuningModal {
+            position: fixed;
+            top: 42px;
+            left: 200px;
+            width: 320px;
+            background-color: #12151b;
+            border: 1px solid #282f3a;
+            border-radius: 6px;
+            padding: 14px;
+            z-index: 100;
+            display: none;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.8);
+        }
+        #tuningModal h4 {
+            color: #58a6ff;
+            font-size: 0.8rem;
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .tuning-row {
+            margin-bottom: 10px;
+        }
+        .tuning-row label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.70rem;
+            color: #8b949e;
+            margin-bottom: 3px;
+        }
+        .tuning-row input[type=range] {
+            width: 100%;
+            height: 4px;
+            background: #21262d;
+            border-radius: 2px;
+            outline: none;
         }
     </style>
 </head>
 <body>
 
-    <!-- Top Minimal Navigation Bar -->
+    <!-- Hidden Video Upload Input -->
+    <input type="file" id="videoUploadInput" accept="video/mp4,video/avi,video/quicktime" style="display:none;" onchange="handleFileUpload(this)">
+
+    <!-- Top Foxglove Control Strip with All Features -->
     <div class="top-navbar">
         <div class="brand">
             <span>🛰️ VISTA</span>
             <span style="color:#4b5563;">|</span>
-            <span style="color:#9ca3af; font-size:0.72rem;">Spatial Tracking & 3D Odometry Ground Station</span>
+            <span style="color:#8b949e; font-size:0.72rem;">Spatial Tracking Telemetry</span>
         </div>
-        <div class="controls">
-            <span style="color:#10b981;">● CONNECTED (30 Hz)</span>
-            <select id="sourceSelect" onchange="changeSource(this.value)">
-                <option value="sample">Source: Sample Flight Video</option>
-                <option value="webcam">Source: Live Laptop Camera</option>
-            </select>
-            <button onclick="triggerReinit()">🔄 Reinit Features</button>
+
+        <div class="action-group">
+            <!-- 1. Live Camera Button -->
+            <button class="nav-btn" id="btnCamera" onclick="setSource('webcam')">
+                <span>📷</span> Live Camera
+            </button>
+
+            <!-- 2. Upload Video Button -->
+            <button class="nav-btn" id="btnUpload" onclick="document.getElementById('videoUploadInput').click()">
+                <span>📁</span> Upload Video
+            </button>
+
+            <!-- 3. Sample Flight Button -->
+            <button class="nav-btn active" id="btnSample" onclick="setSource('sample')">
+                <span>🎞️</span> Sample Flight
+            </button>
+
+            <span style="color:#21262d; margin:0 4px;">|</span>
+
+            <!-- 4. Play / Pause Button -->
+            <button class="nav-btn" id="btnPlayPause" onclick="togglePause()">
+                <span>⏸</span> Pause
+            </button>
+
+            <!-- 5. Reinitialize Button -->
+            <button class="nav-btn" onclick="triggerReinit()">
+                <span>🔄</span> Reinit
+            </button>
+
+            <!-- 6. Snapshot Button -->
+            <button class="nav-btn" onclick="captureSnapshot()">
+                <span>📸</span> Snapshot
+            </button>
+
+            <!-- 7. Export CSV Button -->
+            <button class="nav-btn" onclick="exportCSV()">
+                <span>📥</span> Export CSV
+            </button>
+
+            <!-- 8. Algorithm Tuning Modal Toggle -->
+            <button class="nav-btn" onclick="toggleTuningModal()">
+                <span>⚙️</span> Tuning
+            </button>
+        </div>
+
+        <div style="font-size:0.70rem; color:#10b981;">
+            <span id="connStatus">● CONNECTED (30 Hz)</span>
         </div>
     </div>
+
+    <!-- Tuning Settings Modal -->
+    <div id="tuningModal">
+        <h4>
+            <span>⚙️ Vision Algorithm Tuning</span>
+            <span style="cursor:pointer; color:#888;" onclick="toggleTuningModal()">✕</span>
+        </h4>
+        <div class="tuning-row">
+            <label><span>Max Corners (maxCorners)</span><span id="lblCorners">160</span></label>
+            <input type="range" id="slCorners" min="30" max="300" step="10" value="160" oninput="applyTuning()">
+        </div>
+        <div class="tuning-row">
+            <label><span>Quality Level</span><span id="lblQuality">0.012</span></label>
+            <input type="range" id="slQuality" min="0.002" max="0.08" step="0.002" value="0.012" oninput="applyTuning()">
+        </div>
+        <div class="tuning-row">
+            <label><span>Min Distance (px)</span><span id="lblDistance">10</span></label>
+            <input type="range" id="slDistance" min="4" max="25" step="1" value="10" oninput="applyTuning()">
+        </div>
+        <div class="tuning-row">
+            <label><span>Trail Decay Rate</span><span id="lblDecay">0.92</span></label>
+            <input type="range" id="slDecay" min="0.80" max="0.98" step="0.01" value="0.92" oninput="applyTuning()">
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast">Notification</div>
 
     <!-- 3-Column Workspace Matching Reference Image -->
     <div class="workspace-grid">
@@ -579,7 +766,7 @@ HTML_CONTENT = """
                     <span class="tools"><span>⊞</span><span>⏵</span><span>⊕</span><span>⚙</span></span>
                 </div>
                 <div class="camera-view">
-                    <img src="/video_feed" alt="VISTA Live Optical Flow Feed">
+                    <img id="videoStreamImg" src="/video_feed" alt="VISTA Live Optical Flow Feed">
                 </div>
             </div>
 
@@ -672,11 +859,9 @@ HTML_CONTENT = """
 
     <!-- Scripts: Real-Time Charts & Three.js 3D Engine -->
     <script>
-        // Max data points in rolling window
         const MAX_POINTS = 55;
         const labels = Array.from({length: MAX_POINTS}, (_, i) => (i * 0.28).toFixed(1));
 
-        // Chart.js Global Defaults for Foxglove Dark Look
         Chart.defaults.color = "#6b7280";
         Chart.defaults.borderColor = "#181a20";
         Chart.defaults.font.family = "monospace";
@@ -795,23 +980,22 @@ HTML_CONTENT = """
         controls.dampingFactor = 0.08;
         controls.target.set(0, 5, 2);
 
-        // 1. Sparse 3D Feature Point Cloud (Matching reference image colored dots)
+        // 1. Sparse 3D Feature Point Cloud
         const pointCount = 1400;
         const geometry = new THREE.BufferGeometry();
         const positions = new Float32Array(pointCount * 3);
         const colors = new Float32Array(pointCount * 3);
 
         const colorPalette = [
-            new THREE.Color(0x22c55e), // green
-            new THREE.Color(0x38bdf8), // cyan
-            new THREE.Color(0xa855f7), // purple
-            new THREE.Color(0xec4899), // magenta
-            new THREE.Color(0xfacc15), // yellow
-            new THREE.Color(0xf97316)  // orange
+            new THREE.Color(0x22c55e),
+            new THREE.Color(0x38bdf8),
+            new THREE.Color(0xa855f7),
+            new THREE.Color(0xec4899),
+            new THREE.Color(0xfacc15),
+            new THREE.Color(0xf97316)
         ];
 
         for (let i = 0; i < pointCount; i++) {
-            // Distribute along flight tunnel
             positions[i * 3 + 0] = (Math.random() - 0.5) * 12;
             positions[i * 3 + 1] = Math.random() * 26 - 4;
             positions[i * 3 + 2] = (Math.random() - 0.2) * 6;
@@ -834,7 +1018,7 @@ HTML_CONTENT = """
         const pointCloud = new THREE.Points(geometry, material);
         scene.add(pointCloud);
 
-        // 2. Continuous 3D Flight Trajectory Trail (Ribbon line)
+        // 2. Continuous 3D Flight Trajectory Trail
         const trajPoints = [];
         for (let y = -2; y < 14; y += 0.25) {
             trajPoints.push(new THREE.Vector3(
@@ -848,7 +1032,7 @@ HTML_CONTENT = """
         const trajLine = new THREE.Line(trajGeo, trajMat);
         scene.add(trajLine);
 
-        // 3. Red Quadcopter Body Pose Ring (Matching reference image pose circle)
+        // 3. Red Quadcopter Body Pose Ring
         const droneGroup = new THREE.Group();
         const ringGeo = new THREE.TorusGeometry(0.55, 0.04, 8, 32);
         const ringMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
@@ -856,7 +1040,6 @@ HTML_CONTENT = """
         droneRing.rotation.x = Math.PI / 2;
         droneGroup.add(droneRing);
 
-        // Heading arrow
         const arrowGeo = new THREE.ConeGeometry(0.18, 0.45, 12);
         const arrowMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
         const arrow = new THREE.Mesh(arrowGeo, arrowMat);
@@ -867,7 +1050,6 @@ HTML_CONTENT = """
         droneGroup.position.set(0, 10, 2.4);
         scene.add(droneGroup);
 
-        // Animation Loop
         function animate() {
             requestAnimationFrame(animate);
             controls.update();
@@ -875,7 +1057,6 @@ HTML_CONTENT = """
         }
         animate();
 
-        // Responsive Resize
         window.addEventListener("resize", () => {
             const w = container.clientWidth;
             const h = container.clientHeight;
@@ -892,14 +1073,12 @@ HTML_CONTENT = """
         ws.onmessage = function(event) {
             const data = JSON.parse(event.data);
 
-            // Update ba mini-plot
             baChart.data.datasets[0].data.shift();
             baChart.data.datasets[0].data.push(data.bax);
             baChart.data.datasets[1].data.shift();
             baChart.data.datasets[1].data.push(data.bay);
             baChart.update();
 
-            // Update bg mini-plot
             bgChart.data.datasets[0].data.shift();
             bgChart.data.datasets[0].data.push(data.bgx);
             bgChart.data.datasets[1].data.shift();
@@ -908,7 +1087,6 @@ HTML_CONTENT = """
             bgChart.data.datasets[2].data.push(data.bgz);
             bgChart.update();
 
-            // Update att plot (pitch, roll, yaw)
             attChart.data.datasets[0].data.shift();
             attChart.data.datasets[0].data.push(data.pitch);
             attChart.data.datasets[1].data.shift();
@@ -917,35 +1095,142 @@ HTML_CONTENT = """
             attChart.data.datasets[2].data.push(data.yaw);
             attChart.update();
 
-            // Update disp plot
             dispChart.data.datasets[0].data.shift();
             dispChart.data.datasets[0].data.push(data.disp_z);
             dispChart.data.datasets[1].data.shift();
             dispChart.data.datasets[1].data.push(data.ref_ground);
             dispChart.update();
 
-            // Update Extrinsics Vector Text Readout
             document.getElementById("vecTimestamp").innerText = `Vector3 @ ${data.timestamp} sec`;
             document.getElementById("vecX").innerText = data.error_x.toFixed(16);
             document.getElementById("vecY").innerText = data.error_y.toFixed(16);
             document.getElementById("vecZ").innerText = data.error_z.toFixed(16);
 
-            // Update 3D drone position
             droneGroup.position.set(data.drone_x, 10 + (data.time * 0.2 % 5), data.drone_z);
+
+            // Update UI buttons based on active source
+            if (data.source === "webcam") {
+                document.getElementById("btnCamera").classList.add("active");
+                document.getElementById("btnSample").classList.remove("active");
+                document.getElementById("btnUpload").classList.remove("active");
+            } else if (data.source === "sample") {
+                document.getElementById("btnSample").classList.add("active");
+                document.getElementById("btnCamera").classList.remove("active");
+                document.getElementById("btnUpload").classList.remove("active");
+            } else {
+                document.getElementById("btnUpload").classList.add("active");
+                document.getElementById("btnCamera").classList.remove("active");
+                document.getElementById("btnSample").classList.remove("active");
+            }
+
+            // Update play/pause button text
+            const btnPlay = document.getElementById("btnPlayPause");
+            if (data.running) {
+                btnPlay.innerHTML = "<span>⏸</span> Pause";
+            } else {
+                btnPlay.innerHTML = "<span>▶</span> Resume";
+            }
         };
 
         ws.onclose = function() {
-            setTimeout(() => {
-                ws = new WebSocket(wsUrl);
-            }, 1000);
+            setTimeout(() => { ws = new WebSocket(wsUrl); }, 1000);
         };
 
-        function triggerReinit() {
-            fetch("/api/reinit", { method: "POST" });
+        // ==================== INTERACTION ACTIONS ====================
+        function showToast(msg) {
+            const t = document.getElementById("toast");
+            t.innerText = msg;
+            t.style.opacity = "1";
+            setTimeout(() => { t.style.opacity = "0"; }, 3000);
         }
 
-        function changeSource(src) {
-            fetch(`/api/source/${src}`, { method: "POST" });
+        function setSource(src) {
+            fetch(`/api/source/${src}`, { method: "POST" })
+                .then(r => r.json())
+                .then(d => {
+                    showToast(`Switched input to: ${src.toUpperCase()}`);
+                    // Refresh video img to force reconnect
+                    document.getElementById("videoStreamImg").src = "/video_feed?t=" + new Date().getTime();
+                });
+        }
+
+        function togglePause() {
+            fetch("/api/toggle_pause", { method: "POST" })
+                .then(r => r.json())
+                .then(d => {
+                    showToast(d.running ? "Tracking Resumed" : "Tracking Paused");
+                });
+        }
+
+        function triggerReinit() {
+            fetch("/api/reinit", { method: "POST" })
+                .then(() => showToast("Features Re-initialized"));
+        }
+
+        function handleFileUpload(input) {
+            if (!input.files || input.files.length === 0) return;
+            const file = input.files[0];
+            const formData = new FormData();
+            formData.append("file", file);
+
+            showToast(`Uploading ${file.name}...`);
+            fetch("/api/upload", {
+                method: "POST",
+                body: formData
+            })
+            .then(r => r.json())
+            .then(d => {
+                showToast(`Loaded video: ${d.filename}`);
+                document.getElementById("videoStreamImg").src = "/video_feed?t=" + new Date().getTime();
+            })
+            .catch(err => {
+                showToast("Upload failed.");
+            });
+        }
+
+        function captureSnapshot() {
+            fetch("/api/screenshot", { method: "POST" })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.status === "ok") {
+                        showToast(`📸 Saved: ${d.filename}`);
+                    } else {
+                        showToast("Snapshot failed.");
+                    }
+                });
+        }
+
+        function exportCSV() {
+            window.location.href = "/api/export_csv";
+            showToast("Downloading Telemetry CSV...");
+        }
+
+        function toggleTuningModal() {
+            const m = document.getElementById("tuningModal");
+            m.style.display = (m.style.display === "block") ? "none" : "block";
+        }
+
+        function applyTuning() {
+            const c = parseInt(document.getElementById("slCorners").value);
+            const q = parseFloat(document.getElementById("slQuality").value);
+            const d = parseInt(document.getElementById("slDistance").value);
+            const decay = parseFloat(document.getElementById("slDecay").value);
+
+            document.getElementById("lblCorners").innerText = c;
+            document.getElementById("lblQuality").innerText = q.toFixed(3);
+            document.getElementById("lblDistance").innerText = d;
+            document.getElementById("lblDecay").innerText = decay.toFixed(2);
+
+            fetch("/api/tuning", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    maxCorners: c,
+                    qualityLevel: q,
+                    minDistance: d,
+                    trailDecay: decay
+                })
+            });
         }
     </script>
 </body>
