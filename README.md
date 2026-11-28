@@ -1,15 +1,17 @@
 # VISTA — Vision-based Inertial-free Spatial Tracking Architecture
+### Category: Disaster Management (Robotics + AI)
 
-> **GPS-Denied Visual Navigation Research Prototype**  
-> **Laboratory Milestone:** Lucas-Kanade Optical Flow Feature Tracking (TRL 4 Laboratory Subsystem)
+> **GPS-Denied Visual Navigation System for Autonomous Search & Rescue Drones**  
+> **Category:** Disaster Management (Robotics + AI)  
+> **Subsystem:** Monocular Visual Odometry, Bidirectional Optical Flow & 3D Spatial SLAM Tracking
 
 ---
 
 ## 1. System Overview
 
-VISTA is an experimental computer vision research prototype developed to evaluate GPS-denied relative spatial tracking and ego-motion estimation using commodity monocular camera imagery.
+VISTA is an advanced robotics and computer vision system engineered for **Disaster Management (Robotics + AI)**. In disaster response scenarios—such as collapsed buildings, subterranean tunnels, urban rubble, post-earthquake search and rescue, dense smoke, or GPS-denied/jammed environments—satellite-based navigation (GPS/GNSS) is completely unavailable or untrustworthy.
 
-When satellite-based positioning systems (GPS/GNSS) are degraded, jammed, or obstructed (such as in urban canyons, indoor warehouses, or electronic-warfare contention environments), autonomous platforms must rely on visual landmarks to perceive movement.
+Autonomous search-and-rescue UAVs/drones must maintain continuous spatial awareness and navigate reliably using only onboard visual sensors. VISTA provides real-time monocular visual odometry, sparse 3D landmark triangulation, continuous SE(3) trajectory estimation, and a Foxglove Studio-style 3D telemetry ground station dashboard.
 
 ```
 +------------------+      +-------------------+      +----------------------------+
@@ -35,10 +37,12 @@ When satellite-based positioning systems (GPS/GNSS) are degraded, jammed, or obs
 
 ## 2. Implemented Modules
 
-| Script | Phase | Description |
+| Module | Purpose | Description |
 | :--- | :--- | :--- |
-| `vista_camera.py` | Phase 1 & 2 | Baseline video acquisition and Shi-Tomasi corner detection. |
-| `vista_optical_flow.py` | Phase 3 & 4 | Lucas-Kanade optical flow, motion trails, adaptive reinitialization, and image-motion estimation. |
+| `server.py` | 3D Ground Station | Foxglove Studio-style interactive WebGL & 3D odometry dashboard (FastAPI + Three.js + Chart.js). |
+| `visual_odometry.py` | Core VO Engine | True monocular visual odometry: Essential Matrix (5-point RANSAC), pose recovery, cheirality-gated landmark triangulation, and SE(3) integration. |
+| `vista_optical_flow.py` | CLI Tracker | Lucas-Kanade optical flow, motion trails, adaptive reinitialization, and CSV telemetry logging. |
+| `vista_camera.py` | Calibration Baseline | Video acquisition baseline and Shi-Tomasi corner detection. |
 
 ---
 
@@ -81,13 +85,16 @@ pip install -r requirements.txt
 
 ## 5. Execution Instructions
 
-### A. Run Optical Flow Feature Tracker (Live Webcam)
+### A. Launch VISTA 3D Ground Station Dashboard (Recommended)
+```bash
+python -m uvicorn server:app --host 0.0.0.0 --port 8501
+```
+Open **`http://localhost:8501`** in any web browser to access the live Foxglove-style telemetry station with interactive 3D WebGL odometry, real-time attitude plots, and live camera feed.
+
+### B. Run Standalone Optical Flow Feature Tracker (CLI)
 ```bash
 python vista_optical_flow.py
-```
-
-### B. Run Optical Flow Tracker on Pre-Recorded Video / Synthetic Test Dataset
-```bash
+# Or with a video input:
 python vista_optical_flow.py --source data/test_videos/sample_flight.mp4
 ```
 
